@@ -1,0 +1,1 @@
+# meteor-module-generator
