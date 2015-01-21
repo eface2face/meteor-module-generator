@@ -4,3 +4,51 @@
 [submodule "modules/meteor-templating/dist"]
 	path = modules/meteor-templating/dist
 	url = https://github.com/eface2face/meteor-tracker
+[submodule "modules/meteor-htmljs/dist"]
+	path = modules/meteor-htmljs/dist
+	url = https://github.com/eface2face/meteor-htmljs
+[submodule "modules/meteor-id-map/dist"]
+	path = modules/meteor-id-map/dist
+	url = https://github.com/eface2face/meteor-id-map
+[submodule "modules/meteor-spacebars-compiler/dist"]
+	path = modules/meteor-spacebars-compiler/dist
+	url = https://github.com/eface2face/meteor-spacebars-compiler
+[submodule "modules/meteor-reactive-var/dist"]
+	path = modules/meteor-reactive-var/dist
+	url = https://github.com/eface2face/meteor-reactive-var
+[submodule "modules/meteor-spacebars/dist"]
+	path = modules/meteor-spacebars/dist
+	url = https://github.com/eface2face/meteor-spacebars
+[submodule "modules/meteor-random/dist"]
+	path = modules/meteor-random/dist
+	url = https://github.com/eface2face/meteor-random
+[submodule "modules/meteor-ordered-dict/dist"]
+	path = modules/meteor-ordered-dict/dist
+	url = https://github.com/eface2face/meteor-ordered-dict
+[submodule "modules/meteor-blaze/dist"]
+	path = modules/meteor-blaze/dist
+	url = https://github.com/eface2face/meteor-blaze
+[submodule "modules/meteor-base64/dist"]
+	path = modules/meteor-base64/dist
+	url = https://github.com/eface2face/meteor-base64
+[submodule "modules/meteor-html-tools/dist"]
+	path = modules/meteor-html-tools/dist
+	url = https://github.com/eface2face/meteor-html-tools
+[submodule "modules/meteor-ejson/dist"]
+	path = modules/meteor-ejson/dist
+	url = https://github.com/eface2face/meteor-ejson
+[submodule "modules/meteor-observe-sequence/dist"]
+	path = modules/meteor-observe-sequence/dist
+	url = https://github.com/eface2face/meteor-observe-sequence
+[submodule "modules/meteor-blaze-tools/dist"]
+	path = modules/meteor-blaze-tools/dist
+	url = https://github.com/eface2face/meteor-blaze-tools
+[submodule "modules/meteor-minimongo/dist"]
+	path = modules/meteor-minimongo/dist
+	url = https://github.com/eface2face/meteor-minimongo
+[submodule "modules/meteor-tracker/dist"]
+	path = modules/meteor-tracker/dist
+	url = https://github.com/eface2face/meteor-tracker
+[submodule "modules/meteor-core/dist"]
+	path = modules/meteor-core/dist
+	url = https://github.com/eface2face/meteor-core

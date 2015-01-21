@@ -1,0 +1,8 @@
+var Package = {};
+var _ = require("lodash");
+var Random = require("meteor-random");
+var Tracker = require("meteor-tracker");
+Package.minimongo = require("meteor-minimongo");
+var LocalCollection = Package.minimongo.LocalCollection;
+var Minimongo = Package.minimongo.Minimongo;
+var ReactiveVar = require("meteor-reactive-var");

@@ -1,0 +1,21 @@
+var HTML = require("meteor-htmljs");
+var Tracker = require("meteor-tracker");
+var Blaze = require("meteor-blaze");
+var ObserveSequence = require("meteor-observe-sequence");
+var ReactiveVar = require("meteor-reactive-var");
+var Template = require("meteor-templating");
+
+Handlebars = {};
+Handlebars.registerHelper = Blaze.registerHelper;
+
+Handlebars._escape = Blaze._escape;
+
+// Return these from {{...}} helpers to achieve the same as returning
+// strings from {{{...}}} helpers
+Handlebars.SafeString = function(string) {
+  this.string = string;
+};
+Handlebars.SafeString.prototype.toString = function() {
+  return this.string.toString();
+};
+
