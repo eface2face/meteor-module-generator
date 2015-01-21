@@ -1,9 +1,6 @@
 [submodule "meteor"]
 	path = meteor
 	url = https://github.com/meteor/meteor
-[submodule "modules/meteor-templating/dist"]
-	path = modules/meteor-templating/dist
-	url = https://github.com/eface2face/meteor-tracker
 [submodule "modules/meteor-htmljs/dist"]
 	path = modules/meteor-htmljs/dist
 	url = https://github.com/eface2face/meteor-htmljs
@@ -52,3 +49,6 @@
 [submodule "modules/meteor-core/dist"]
 	path = modules/meteor-core/dist
 	url = https://github.com/eface2face/meteor-core
+[submodule "modules/meteor-templating/dist"]
+	path = modules/meteor-templating/dist
+	url = https://github.com/eface2face/meteor-templating
