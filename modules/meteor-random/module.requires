@@ -1,2 +1,2 @@
 var _ = require("lodash");
-var Meteor = require("module-core");
+var Meteor = require("meteor-core");
