@@ -1,3 +1,5 @@
-var _ = require("lodash");
-var Base64 = require("meteor-base64");
-var EJSON;
+module.exports=function(Meteor) {
+  var _ = Meteor.underscore;
+  var Base64 = Meteor.Base64
+  var EJSON;
+  var EJSONTest;

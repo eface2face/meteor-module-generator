@@ -1,1 +1,3 @@
-module.exports = Meteor;
+  Meteor.underscore = _;
+  return Meteor;
+};

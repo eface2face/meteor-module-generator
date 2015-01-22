@@ -1,2 +1,4 @@
-var HTML = require("meteor-htmljs");
-var HTMLTools;
+module.exports = function(Meteor) {
+  var HTML = Meteor.HTML;
+  var HTMLTools;
+  var TEMPLATE_TAG_POSITION;

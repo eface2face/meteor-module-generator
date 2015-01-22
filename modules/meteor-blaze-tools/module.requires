@@ -1,4 +1,7 @@
-var _ = require("lodash");
-var HTML = require("meteor-htmljs");
-var BlazeTools;
+module.exports = function(Meteor) {
+  var _ = Meteor.underscore;
+  var HTML = Meteor.HTML;
+  var BlazeTools;
+  var ToJSVisitor;
+  var toJSLiteral;
 

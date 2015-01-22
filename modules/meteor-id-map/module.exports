@@ -1,1 +1,2 @@
-module.exports = IdMap;
+  Meteor.IdMap = IdMap;
+};

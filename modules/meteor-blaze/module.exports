@@ -1,1 +1,3 @@
-module.exports = Blaze;
+  Meteor.Blaze = Blaze;
+  Meteor.jQuery = jQuery;
+};

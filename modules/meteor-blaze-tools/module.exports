@@ -1,1 +1,2 @@
-module.exports = BlazeTools;
+  Meteor.BlazeTools = BlazeTools;
+};

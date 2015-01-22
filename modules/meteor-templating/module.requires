@@ -1,5 +1,5 @@
-var _ = require("lodash");
-var Meteor = require("meteor-core");
-var Blaze = require("meteor-blaze");
-var UI = {};
-var SpacebarsCompiler;
+module.exports = function(Meteor) {
+  var _ = Meteor.underscore;
+  var Blaze = Meteor.Blaze;
+  var UI = {};
+  var Template;

@@ -1,1 +1,2 @@
-module.exports = HTMLTools;
+  Meteor.HTMLTools = HTMLTools;
+};

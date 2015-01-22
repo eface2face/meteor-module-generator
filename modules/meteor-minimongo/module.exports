@@ -1,1 +1,3 @@
-module.exports = { Minimongo: Minimongo, LocalCollection: LocalCollection};
+  Meteor.Minimongo = Minimongo;
+  Meteor.LocalCollection = LocalCollection;
+};
