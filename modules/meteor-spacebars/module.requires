@@ -5,7 +5,8 @@ var ObserveSequence = require("meteor-observe-sequence");
 var ReactiveVar = require("meteor-reactive-var");
 var Template = require("meteor-templating");
 
-Handlebars = {};
+var Spacebars;
+var Handlebars = {};
 Handlebars.registerHelper = Blaze.registerHelper;
 
 Handlebars._escape = Blaze._escape;

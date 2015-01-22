@@ -1,1 +1,2 @@
 var Meteor = require("meteor-core");
+var Tracker;

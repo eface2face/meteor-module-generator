@@ -1,1 +1,2 @@
 var HTML = require("meteor-htmljs");
+var HTMLTools;
