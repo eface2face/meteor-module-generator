@@ -52,3 +52,6 @@
 [submodule "modules/meteor-templating/dist"]
 	path = modules/meteor-templating/dist
 	url = https://github.com/eface2face/meteor-templating
+[submodule "client"]
+	path = client
+	url = git@github.com:eface2face/meteor-client.git
