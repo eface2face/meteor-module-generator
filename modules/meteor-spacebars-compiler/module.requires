@@ -1,4 +1,5 @@
 module.exports = function(Meteor) {
+  var _ = Meteor.underscore;
   var HTML = Meteor.HTML;
   var HTMLTools = Meteor.HTMLTools;
   var BlazeTools = Meteor.BlazeTools;
