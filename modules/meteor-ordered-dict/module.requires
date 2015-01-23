@@ -1,3 +1,3 @@
-module.export = function(Meteor) {
+module.exports = function(Meteor) {
   var _ = Meteor.underscore;
   var OrderedDict;

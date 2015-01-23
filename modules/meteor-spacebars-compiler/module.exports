@@ -1,1 +1,2 @@
-module.exports = SpacebarsCompiler;
+  Meteor.SpacebarsCompiler = SpacebarsCompiler;
+};

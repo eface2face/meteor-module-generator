@@ -1,4 +1,4 @@
-module.exports = function(Meteor);
+module.exports = function(Meteor) {
 var HTML = Meteor.HTML;
 var Tracker = Meteor.Tracker;
 var Blaze = Meteor.Blaze;
