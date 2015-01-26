@@ -7,5 +7,5 @@ module.exports = function(Meteor) {
   var ReactiveVar = Meteor.ReactiveVar;
   var Package = {};
   Package.minimongo = Meteor.Minimongo;
-  Packate.minimongo.LocalCollection = LocalCollection;
+  Package.minimongo.LocalCollection = LocalCollection;
   var ObserveSequence;

@@ -5,7 +5,7 @@ var Blaze = Meteor.Blaze;
 var ObserveSequence = Meteor.ObserveSequence;
 var ReactiveVar = Meteor.ReactiveVar;
 var Template = Meteor.Template;
-
+Blaze.ReactiveVar = ReactiveVar;
 var Spacebars;
 var Handlebars = {};
 Handlebars.registerHelper = Blaze.registerHelper;
