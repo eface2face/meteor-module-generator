@@ -58,3 +58,6 @@
 [submodule "plugin"]
 	path = plugin
 	url = git@github.com:eface2face/jquery-meteor-blaze.git
+[submodule "spacebars-compiler"]
+	path = spacebars-compiler
+	url = git@github.com:eface2face/spacebars-compiler.git
