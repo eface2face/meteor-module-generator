@@ -61,3 +61,9 @@
 [submodule "spacebars-compiler"]
 	path = spacebars-compiler
 	url = git@github.com:eface2face/spacebars-compiler.git
+[submodule "ext/meteor-object-map"]
+	path = ext/meteor-object-map
+	url = git@github.com:eface2face/meteor-object-map.git
+[submodule "ext/meteor-reactive-object-map"]
+	path = ext/meteor-reactive-object-map
+	url = git@github.com:eface2face/meteor-reactive-object-map.git
