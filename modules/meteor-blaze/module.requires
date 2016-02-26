@@ -1,4 +1,5 @@
 module.exports = function(Meteor,jQuery) {
+  var AttributeHandler, makeAttributeHandler, ElementAttributesUpdater, toObjectLiteralKey;
   var _ = Meteor.underscore;
   var HTML = Meteor.HTML;
   var ObserveSequence = Meteor.ObserveSequence;

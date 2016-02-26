@@ -1,4 +1,5 @@
 module.exports = function(Meteor) {
+  var IDENTITY ,SLICE, Scanner, makeRegexMatcher, getCharacterReference, getComment, getDoctype, getHTMLToken, getTagToken, isLookingAtEndTag, codePointToString, getContent, getRCData;
   var HTML = Meteor.HTML;
   var HTMLTools;
   var TEMPLATE_TAG_POSITION;
