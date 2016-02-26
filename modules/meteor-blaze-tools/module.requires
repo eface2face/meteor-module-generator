@@ -1,4 +1,5 @@
 module.exports = function(Meteor) {
+  var toObjectLiteralKey;
   var _ = Meteor.underscore;
   var HTML = Meteor.HTML;
   var BlazeTools;
