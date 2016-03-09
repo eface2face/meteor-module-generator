@@ -16,4 +16,6 @@ cd meteor-blaze-tools && ./build.sh && cd ..
 cd meteor-minimongo && ./build.sh && cd ..
 cd meteor-tracker && ./build.sh && cd ..
 cd meteor-core && ./build.sh && cd ..
+cd meteor-tinytest && ./build.sh && cd ..
+cd meteor-mongo-id && ./build.sh && cd ..
 

@@ -67,3 +67,6 @@
 [submodule "ext/meteor-reactive-object-map"]
 	path = ext/meteor-reactive-object-map
 	url = git@github.com:eface2face/meteor-reactive-object-map.git
+[submodule "modules/meteor-mongo-id/dist"]
+	path = modules/meteor-mongo-id/dist
+	url = git@github.com:eface2face/meteor-mongo-id.git

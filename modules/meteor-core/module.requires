@@ -1,4 +1,5 @@
 module.exports = function(underscore) {
   var Meteor;
   var _ = underscore; 
+  var Package = {};
 
