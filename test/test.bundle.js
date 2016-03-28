@@ -13910,94 +13910,6 @@ if (typeof __meteor_runtime_config__ === 'object' &&
    */
   Meteor.settings = { 'public': __meteor_runtime_config__.PUBLIC_SETTINGS };
 }
-var callbackQueue = [];
-var isLoadingCompleted = false;
-var isReady = false;
-
-// Keeps track of how many events to wait for in addition to loading completing,
-// before we're considered ready.
-var readyHoldsCount = 0;
-
-var holdReady =  function () {
-  readyHoldsCount++;
-}
-
-var releaseReadyHold = function () {
-  readyHoldsCount--;
-  maybeReady();
-}
-
-var maybeReady = function () {
-  if (isReady || !isLoadingCompleted || readyHoldsCount > 0)
-    return;
-
-  isReady = true;
-
-  // Run startup callbacks
-  while (callbackQueue.length)
-    (callbackQueue.shift())();
-
-  if (Meteor.isCordova) {
-    // Notify the WebAppLocalServer plugin that startup was completed successfully,
-    // so we can roll back faulty versions if this doesn't happen
-    WebAppLocalServer.startupDidComplete();
-  }
-};
-
-var loadingCompleted = function () {
-  if (!isLoadingCompleted) {
-    isLoadingCompleted = true;
-    maybeReady();
-  }
-}
-
-if (Meteor.isCordova) {
-  holdReady();
-  document.addEventListener('deviceready', releaseReadyHold, false);
-}
-
-if (document.readyState === 'complete' || document.readyState === 'loaded') {
-  // Loading has completed,
-  // but allow other scripts the opportunity to hold ready
-  window.setTimeout(loadingCompleted);
-} else { // Attach event listeners to wait for loading to complete
-  if (document.addEventListener) {
-    document.addEventListener('DOMContentLoaded', loadingCompleted, false);
-    window.addEventListener('load', loadingCompleted, false);
-  } else { // Use IE event model for < IE9
-    document.attachEvent('onreadystatechange', function () {
-      if (document.readyState === "complete") {
-        loadingCompleted();
-      }
-    });
-    window.attachEvent('load', loadingCompleted);
-  }
-}
-
-/**
- * @summary Run code when a client or a server starts.
- * @locus Anywhere
- * @param {Function} func A function to run on startup.
- */
-Meteor.startup = function (callback) {
-  // Fix for < IE9, see http://javascript.nwbox.com/IEContentLoaded/
-  var doScroll = !document.addEventListener &&
-    document.documentElement.doScroll;
-
-  if (!doScroll || window !== top) {
-    if (isReady)
-      callback();
-    else
-      callbackQueue.push(callback);
-  } else {
-    try { doScroll('left'); }
-    catch (error) {
-      setTimeout(function () { Meteor.startup(callback); }, 50);
-      return;
-    };
-    callback();
-  }
-};
 var suppress = 0;
 
 // replacement for console.log. This is a temporary API. We should
@@ -25310,6 +25222,50 @@ SpacebarsCompiler.optimize = function (tree) {
   tree = (new RawReplacingVisitor).visit(tree);
   return tree;
 };
+// A visitor to ensure that React components included via the `{{>
+// React}}` template defined in the react-template-helper package are
+// the only child in their parent component. Otherwise `React.render`
+// would eliminate all of their sibling nodes.
+//
+// It's a little strange that this logic is in spacebars-compiler if
+// it's only relevant to a specific package but there's no way to have
+// a package hook into a build plugin.
+ReactComponentSiblingForbidder = HTML.Visitor.extend();
+ReactComponentSiblingForbidder.def({
+  visitArray: function (array, parentTag) {
+    for (var i = 0; i < array.length; i++) {
+      this.visit(array[i], parentTag);
+    }
+  },
+  visitObject: function (obj, parentTag) {
+    if (obj.type === "INCLUSION" && obj.path.length === 1 && obj.path[0] === "React") {
+      if (!parentTag) {
+        throw new Error(
+          "{{> React}} must be used in a container element"
+            + (this.sourceName ? (" in " + this.sourceName) : "")
+               + ". Learn more at https://github.com/meteor/meteor/wiki/React-components-must-be-the-only-thing-in-their-wrapper-element");
+      }
+
+      var numSiblings = 0;
+      for (var i = 0; i < parentTag.children.length; i++) {
+        var child = parentTag.children[i];
+        if (child !== obj && !(typeof child === "string" && child.match(/^\s*$/))) {
+          numSiblings++;
+        }
+      }
+
+      if (numSiblings > 0) {
+        throw new Error(
+          "{{> React}} must be used as the only child in a container element"
+            + (this.sourceName ? (" in " + this.sourceName) : "")
+               + ". Learn more at https://github.com/meteor/meteor/wiki/React-components-must-be-the-only-thing-in-their-wrapper-element");
+      }
+    }
+  },
+  visitTag: function (tag) {
+    this.visitArray(tag.children, tag /*parentTag*/);
+  }
+});
 // ============================================================
 // Code-generation of template tags
 
