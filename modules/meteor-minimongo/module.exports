@@ -1,3 +1,4 @@
   Meteor.Minimongo = Minimongo;
+  Meteor.MinimongoTest = MinimongoTest;
   Meteor.LocalCollection = LocalCollection;
 };

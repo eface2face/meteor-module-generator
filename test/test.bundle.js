@@ -185,10 +185,12 @@ var Meteor = require("./modules/meteor-core/dist/meteor.js")(underscore);
 require("./modules/meteor-base64/dist/base64.js")(Meteor);
 require("./modules/meteor-ejson/dist/ejson.js")(Meteor);
 require("./modules/meteor-random/dist/random.js")(Meteor);
+require("./modules/meteor-diff-sequence/dist/diff-sequence.js")(Meteor);
 require("./modules/meteor-mongo-id/dist/mongo-id.js")(Meteor);
 require("./modules/meteor-id-map/dist/id-map.js")(Meteor);
 require("./modules/meteor-ordered-dict/dist/ordered_dict.js")(Meteor);
 require("./modules/meteor-tracker/dist/tracker.js")(Meteor);
+require("./modules/meteor-minimongo/dist/minimongo.js")(Meteor);
 require("./modules/meteor-observe-sequence/dist/observe_sequence.js")(Meteor);
 require("./modules/meteor-htmljs/dist/html.js")(Meteor);
 require("./modules/meteor-html-tools/dist/html-tools.js")(Meteor);
@@ -208,7 +210,502 @@ global.$ = jquery;
 global.Meteor = Meteor;
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./ext/meteor-reactive-object-map/reactive-object-map.js":2,"./modules/meteor-base64/dist/base64.js":19,"./modules/meteor-blaze-tools/dist/blaze-tools.js":20,"./modules/meteor-blaze/dist/blaze.js":21,"./modules/meteor-core/dist/meteor.js":22,"./modules/meteor-ejson/dist/ejson.js":23,"./modules/meteor-html-tools/dist/html-tools.js":24,"./modules/meteor-htmljs/dist/html.js":25,"./modules/meteor-id-map/dist/id-map.js":26,"./modules/meteor-mongo-id/dist/mongo-id.js":27,"./modules/meteor-observe-sequence/dist/observe_sequence.js":28,"./modules/meteor-ordered-dict/dist/ordered_dict.js":29,"./modules/meteor-random/dist/random.js":30,"./modules/meteor-reactive-var/dist/reactive-var.js":31,"./modules/meteor-spacebars-compiler/dist/spacebars-compiler.js":32,"./modules/meteor-spacebars/dist/spacebars.js":33,"./modules/meteor-templating/dist/templating.js":34,"./modules/meteor-tinytest/dist/tinytest.js":35,"./modules/meteor-tracker/dist/tracker.js":36,"jquery":37,"lodash":38}],4:[function(require,module,exports){
+},{"./ext/meteor-reactive-object-map/reactive-object-map.js":2,"./modules/meteor-base64/dist/base64.js":31,"./modules/meteor-blaze-tools/dist/blaze-tools.js":32,"./modules/meteor-blaze/dist/blaze.js":33,"./modules/meteor-core/dist/meteor.js":34,"./modules/meteor-diff-sequence/dist/diff-sequence.js":35,"./modules/meteor-ejson/dist/ejson.js":36,"./modules/meteor-html-tools/dist/html-tools.js":37,"./modules/meteor-htmljs/dist/html.js":38,"./modules/meteor-id-map/dist/id-map.js":39,"./modules/meteor-minimongo/dist/minimongo.js":40,"./modules/meteor-mongo-id/dist/mongo-id.js":41,"./modules/meteor-observe-sequence/dist/observe_sequence.js":42,"./modules/meteor-ordered-dict/dist/ordered_dict.js":43,"./modules/meteor-random/dist/random.js":44,"./modules/meteor-reactive-var/dist/reactive-var.js":45,"./modules/meteor-spacebars-compiler/dist/spacebars-compiler.js":46,"./modules/meteor-spacebars/dist/spacebars.js":47,"./modules/meteor-templating/dist/templating.js":48,"./modules/meteor-tinytest/dist/tinytest.js":49,"./modules/meteor-tracker/dist/tracker.js":50,"jquery":51,"lodash":52}],4:[function(require,module,exports){
+///
+/// Remote methods and access control.
+///
+
+// Restrict default mutators on collection. allow() and deny() take the
+// same options:
+//
+// options.insert {Function(userId, doc)}
+//   return true to allow/deny adding this document
+//
+// options.update {Function(userId, docs, fields, modifier)}
+//   return true to allow/deny updating these documents.
+//   `fields` is passed as an array of fields that are to be modified
+//
+// options.remove {Function(userId, docs)}
+//   return true to allow/deny removing these documents
+//
+// options.fetch {Array}
+//   Fields to fetch for these validators. If any call to allow or deny
+//   does not have this option then all fields are loaded.
+//
+// allow and deny can be called multiple times. The validators are
+// evaluated as follows:
+// - If neither deny() nor allow() has been called on the collection,
+//   then the request is allowed if and only if the "insecure" smart
+//   package is in use.
+// - Otherwise, if any deny() function returns true, the request is denied.
+// - Otherwise, if any allow() function returns true, the request is allowed.
+// - Otherwise, the request is denied.
+//
+// Meteor may call your deny() and allow() functions in any order, and may not
+// call all of them if it is able to make a decision without calling them all
+// (so don't include side effects).
+
+AllowDeny = {
+  CollectionPrototype: {}
+};
+
+// In the `mongo` package, we will extend Mongo.Collection.prototype with these
+// methods
+const CollectionPrototype = AllowDeny.CollectionPrototype;
+
+/**
+ * @summary Allow users to write directly to this collection from client code, subject to limitations you define.
+ * @locus Server
+ * @method allow
+ * @memberOf Mongo.Collection
+ * @instance
+ * @param {Object} options
+ * @param {Function} options.insert,update,remove Functions that look at a proposed modification to the database and return true if it should be allowed.
+ * @param {String[]} options.fetch Optional performance enhancement. Limits the fields that will be fetched from the database for inspection by your `update` and `remove` functions.
+ * @param {Function} options.transform Overrides `transform` on the  [`Collection`](#collections).  Pass `null` to disable transformation.
+ */
+CollectionPrototype.allow = function(options) {
+  addValidator(this, 'allow', options);
+};
+
+/**
+ * @summary Override `allow` rules.
+ * @locus Server
+ * @method deny
+ * @memberOf Mongo.Collection
+ * @instance
+ * @param {Object} options
+ * @param {Function} options.insert,update,remove Functions that look at a proposed modification to the database and return true if it should be denied, even if an [allow](#allow) rule says otherwise.
+ * @param {String[]} options.fetch Optional performance enhancement. Limits the fields that will be fetched from the database for inspection by your `update` and `remove` functions.
+ * @param {Function} options.transform Overrides `transform` on the  [`Collection`](#collections).  Pass `null` to disable transformation.
+ */
+CollectionPrototype.deny = function(options) {
+  addValidator(this, 'deny', options);
+};
+
+CollectionPrototype._defineMutationMethods = function() {
+  const self = this;
+
+  // set to true once we call any allow or deny methods. If true, use
+  // allow/deny semantics. If false, use insecure mode semantics.
+  self._restricted = false;
+
+  // Insecure mode (default to allowing writes). Defaults to 'undefined' which
+  // means insecure iff the insecure package is loaded. This property can be
+  // overriden by tests or packages wishing to change insecure mode behavior of
+  // their collections.
+  self._insecure = undefined;
+
+  self._validators = {
+    insert: {allow: [], deny: []},
+    update: {allow: [], deny: []},
+    remove: {allow: [], deny: []},
+    upsert: {allow: [], deny: []}, // dummy arrays; can't set these!
+    fetch: [],
+    fetchAllFields: false
+  };
+
+  if (!self._name)
+    return; // anonymous collection
+
+  // XXX Think about method namespacing. Maybe methods should be
+  // "Meteor:Mongo:insert/NAME"?
+  self._prefix = '/' + self._name + '/';
+
+  // mutation methods
+  if (self._connection) {
+    const m = {};
+
+    _.each(['insert', 'update', 'remove'], function (method) {
+      m[self._prefix + method] = function (/* ... */) {
+        // All the methods do their own validation, instead of using check().
+        check(arguments, [Match.Any]);
+        const args = _.toArray(arguments);
+        try {
+          // For an insert, if the client didn't specify an _id, generate one
+          // now; because this uses DDP.randomStream, it will be consistent with
+          // what the client generated. We generate it now rather than later so
+          // that if (eg) an allow/deny rule does an insert to the same
+          // collection (not that it really should), the generated _id will
+          // still be the first use of the stream and will be consistent.
+          //
+          // However, we don't actually stick the _id onto the document yet,
+          // because we want allow/deny rules to be able to differentiate
+          // between arbitrary client-specified _id fields and merely
+          // client-controlled-via-randomSeed fields.
+          let generatedId = null;
+          if (method === "insert" && !_.has(args[0], '_id')) {
+            generatedId = self._makeNewID();
+          }
+
+          if (this.isSimulation) {
+            // In a client simulation, you can do any mutation (even with a
+            // complex selector).
+            if (generatedId !== null)
+              args[0]._id = generatedId;
+            return self._collection[method].apply(
+              self._collection, args);
+          }
+
+          // This is the server receiving a method call from the client.
+
+          // We don't allow arbitrary selectors in mutations from the client: only
+          // single-ID selectors.
+          if (method !== 'insert')
+            throwIfSelectorIsNotId(args[0], method);
+
+          if (self._restricted) {
+            // short circuit if there is no way it will pass.
+            if (self._validators[method].allow.length === 0) {
+              throw new Meteor.Error(
+                403, "Access denied. No allow validators set on restricted " +
+                  "collection for method '" + method + "'.");
+            }
+
+            const validatedMethodName =
+                  '_validated' + method.charAt(0).toUpperCase() + method.slice(1);
+            args.unshift(this.userId);
+            method === 'insert' && args.push(generatedId);
+            return self[validatedMethodName].apply(self, args);
+          } else if (self._isInsecure()) {
+            if (generatedId !== null)
+              args[0]._id = generatedId;
+            // In insecure mode, allow any mutation (with a simple selector).
+            // XXX This is kind of bogus.  Instead of blindly passing whatever
+            //     we get from the network to this function, we should actually
+            //     know the correct arguments for the function and pass just
+            //     them.  For example, if you have an extraneous extra null
+            //     argument and this is Mongo on the server, the .wrapAsync'd
+            //     functions like update will get confused and pass the
+            //     "fut.resolver()" in the wrong slot, where _update will never
+            //     invoke it. Bam, broken DDP connection.  Probably should just
+            //     take this whole method and write it three times, invoking
+            //     helpers for the common code.
+            return self._collection[method].apply(self._collection, args);
+          } else {
+            // In secure mode, if we haven't called allow or deny, then nothing
+            // is permitted.
+            throw new Meteor.Error(403, "Access denied");
+          }
+        } catch (e) {
+          if (e.name === 'MongoError' || e.name === 'MinimongoError') {
+            throw new Meteor.Error(409, e.toString());
+          } else {
+            throw e;
+          }
+        }
+      };
+    });
+    // Minimongo on the server gets no stubs; instead, by default
+    // it wait()s until its result is ready, yielding.
+    // This matches the behavior of macromongo on the server better.
+    // XXX see #MeteorServerNull
+    if (Meteor.isClient || self._connection === Meteor.server)
+      self._connection.methods(m);
+  }
+};
+
+CollectionPrototype._updateFetch = function (fields) {
+  const self = this;
+
+  if (!self._validators.fetchAllFields) {
+    if (fields) {
+      self._validators.fetch = _.union(self._validators.fetch, fields);
+    } else {
+      self._validators.fetchAllFields = true;
+      // clear fetch just to make sure we don't accidentally read it
+      self._validators.fetch = null;
+    }
+  }
+};
+
+CollectionPrototype._isInsecure = function () {
+  const self = this;
+  if (self._insecure === undefined)
+    return !!Package.insecure;
+  return self._insecure;
+};
+
+CollectionPrototype._validatedInsert = function (userId, doc,
+                                                         generatedId) {
+  const self = this;
+
+  // call user validators.
+  // Any deny returns true means denied.
+  if (_.any(self._validators.insert.deny, function(validator) {
+    return validator(userId, docToValidate(validator, doc, generatedId));
+  })) {
+    throw new Meteor.Error(403, "Access denied");
+  }
+  // Any allow returns true means proceed. Throw error if they all fail.
+  if (_.all(self._validators.insert.allow, function(validator) {
+    return !validator(userId, docToValidate(validator, doc, generatedId));
+  })) {
+    throw new Meteor.Error(403, "Access denied");
+  }
+
+  // If we generated an ID above, insert it now: after the validation, but
+  // before actually inserting.
+  if (generatedId !== null)
+    doc._id = generatedId;
+
+  self._collection.insert.call(self._collection, doc);
+};
+
+// Simulate a mongo `update` operation while validating that the access
+// control rules set by calls to `allow/deny` are satisfied. If all
+// pass, rewrite the mongo operation to use $in to set the list of
+// document ids to change ##ValidatedChange
+CollectionPrototype._validatedUpdate = function(
+    userId, selector, mutator, options) {
+  const self = this;
+
+  check(mutator, Object);
+
+  options = _.clone(options) || {};
+
+  if (!LocalCollection._selectorIsIdPerhapsAsObject(selector))
+    throw new Error("validated update should be of a single ID");
+
+  // We don't support upserts because they don't fit nicely into allow/deny
+  // rules.
+  if (options.upsert)
+    throw new Meteor.Error(403, "Access denied. Upserts not " +
+                           "allowed in a restricted collection.");
+
+  const noReplaceError = "Access denied. In a restricted collection you can only" +
+        " update documents, not replace them. Use a Mongo update operator, such " +
+        "as '$set'.";
+
+  // compute modified fields
+  const fields = [];
+  if (_.isEmpty(mutator)) {
+    throw new Meteor.Error(403, noReplaceError);
+  }
+  _.each(mutator, function (params, op) {
+    if (op.charAt(0) !== '$') {
+      throw new Meteor.Error(403, noReplaceError);
+    } else if (!_.has(ALLOWED_UPDATE_OPERATIONS, op)) {
+      throw new Meteor.Error(
+        403, "Access denied. Operator " + op + " not allowed in a restricted collection.");
+    } else {
+      _.each(_.keys(params), function (field) {
+        // treat dotted fields as if they are replacing their
+        // top-level part
+        if (field.indexOf('.') !== -1)
+          field = field.substring(0, field.indexOf('.'));
+
+        // record the field we are trying to change
+        if (!_.contains(fields, field))
+          fields.push(field);
+      });
+    }
+  });
+
+  const findOptions = {transform: null};
+  if (!self._validators.fetchAllFields) {
+    findOptions.fields = {};
+    _.each(self._validators.fetch, function(fieldName) {
+      findOptions.fields[fieldName] = 1;
+    });
+  }
+
+  const doc = self._collection.findOne(selector, findOptions);
+  if (!doc)  // none satisfied!
+    return 0;
+
+  // call user validators.
+  // Any deny returns true means denied.
+  if (_.any(self._validators.update.deny, function(validator) {
+    const factoriedDoc = transformDoc(validator, doc);
+    return validator(userId,
+                     factoriedDoc,
+                     fields,
+                     mutator);
+  })) {
+    throw new Meteor.Error(403, "Access denied");
+  }
+  // Any allow returns true means proceed. Throw error if they all fail.
+  if (_.all(self._validators.update.allow, function(validator) {
+    const factoriedDoc = transformDoc(validator, doc);
+    return !validator(userId,
+                      factoriedDoc,
+                      fields,
+                      mutator);
+  })) {
+    throw new Meteor.Error(403, "Access denied");
+  }
+
+  options._forbidReplace = true;
+
+  // Back when we supported arbitrary client-provided selectors, we actually
+  // rewrote the selector to include an _id clause before passing to Mongo to
+  // avoid races, but since selector is guaranteed to already just be an ID, we
+  // don't have to any more.
+
+  return self._collection.update.call(
+    self._collection, selector, mutator, options);
+};
+
+// Only allow these operations in validated updates. Specifically
+// whitelist operations, rather than blacklist, so new complex
+// operations that are added aren't automatically allowed. A complex
+// operation is one that does more than just modify its target
+// field. For now this contains all update operations except '$rename'.
+// http://docs.mongodb.org/manual/reference/operators/#update
+const ALLOWED_UPDATE_OPERATIONS = {
+  $inc:1, $set:1, $unset:1, $addToSet:1, $pop:1, $pullAll:1, $pull:1,
+  $pushAll:1, $push:1, $bit:1
+};
+
+// Simulate a mongo `remove` operation while validating access control
+// rules. See #ValidatedChange
+CollectionPrototype._validatedRemove = function(userId, selector) {
+  const self = this;
+
+  const findOptions = {transform: null};
+  if (!self._validators.fetchAllFields) {
+    findOptions.fields = {};
+    _.each(self._validators.fetch, function(fieldName) {
+      findOptions.fields[fieldName] = 1;
+    });
+  }
+
+  const doc = self._collection.findOne(selector, findOptions);
+  if (!doc)
+    return 0;
+
+  // call user validators.
+  // Any deny returns true means denied.
+  if (_.any(self._validators.remove.deny, function(validator) {
+    return validator(userId, transformDoc(validator, doc));
+  })) {
+    throw new Meteor.Error(403, "Access denied");
+  }
+  // Any allow returns true means proceed. Throw error if they all fail.
+  if (_.all(self._validators.remove.allow, function(validator) {
+    return !validator(userId, transformDoc(validator, doc));
+  })) {
+    throw new Meteor.Error(403, "Access denied");
+  }
+
+  // Back when we supported arbitrary client-provided selectors, we actually
+  // rewrote the selector to {_id: {$in: [ids that we found]}} before passing to
+  // Mongo to avoid races, but since selector is guaranteed to already just be
+  // an ID, we don't have to any more.
+
+  return self._collection.remove.call(self._collection, selector);
+};
+
+CollectionPrototype._callMutatorMethod = function _callMutatorMethod(name, args, callback) {
+  if (Meteor.isClient && !callback && !alreadyInSimulation()) {
+    // Client can't block, so it can't report errors by exception,
+    // only by callback. If they forget the callback, give them a
+    // default one that logs the error, so they aren't totally
+    // baffled if their writes don't work because their database is
+    // down.
+    // Don't give a default callback in simulation, because inside stubs we
+    // want to return the results from the local collection immediately and
+    // not force a callback.
+    callback = function (err) {
+      if (err)
+        Meteor._debug(name + " failed: " + (err.reason || err.stack));
+    };
+  }
+
+  // For two out of three mutator methods, the first argument is a selector
+  const firstArgIsSelector = name === "update" || name === "remove";
+  if (firstArgIsSelector && !alreadyInSimulation()) {
+    // If we're about to actually send an RPC, we should throw an error if
+    // this is a non-ID selector, because the mutation methods only allow
+    // single-ID selectors. (If we don't throw here, we'll see flicker.)
+    throwIfSelectorIsNotId(args[0], name);
+  }
+
+  const mutatorMethodName = this._prefix + name;
+  return this._connection.apply(
+    mutatorMethodName, args, { returnStubValue: true }, callback);
+}
+
+function transformDoc(validator, doc) {
+  if (validator.transform)
+    return validator.transform(doc);
+  return doc;
+}
+
+function docToValidate(validator, doc, generatedId) {
+  let ret = doc;
+  if (validator.transform) {
+    ret = EJSON.clone(doc);
+    // If you set a server-side transform on your collection, then you don't get
+    // to tell the difference between "client specified the ID" and "server
+    // generated the ID", because transforms expect to get _id.  If you want to
+    // do that check, you can do it with a specific
+    // `C.allow({insert: f, transform: null})` validator.
+    if (generatedId !== null) {
+      ret._id = generatedId;
+    }
+    ret = validator.transform(ret);
+  }
+  return ret;
+}
+
+function addValidator(collection, allowOrDeny, options) {
+  // validate keys
+  const VALID_KEYS = ['insert', 'update', 'remove', 'fetch', 'transform'];
+  _.each(_.keys(options), function (key) {
+    if (!_.contains(VALID_KEYS, key))
+      throw new Error(allowOrDeny + ": Invalid key: " + key);
+  });
+
+  collection._restricted = true;
+
+  _.each(['insert', 'update', 'remove'], function (name) {
+    if (options.hasOwnProperty(name)) {
+      if (!(options[name] instanceof Function)) {
+        throw new Error(allowOrDeny + ": Value for `" + name + "` must be a function");
+      }
+
+      // If the transform is specified at all (including as 'null') in this
+      // call, then take that; otherwise, take the transform from the
+      // collection.
+      if (options.transform === undefined) {
+        options[name].transform = collection._transform;  // already wrapped
+      } else {
+        options[name].transform = LocalCollection.wrapTransform(
+          options.transform);
+      }
+
+      collection._validators[name][allowOrDeny].push(options[name]);
+    }
+  });
+
+  // Only update the fetch fields if we're passed things that affect
+  // fetching. This way allow({}) and allow({insert: f}) don't result in
+  // setting fetchAllFields
+  if (options.update || options.remove || options.fetch) {
+    if (options.fetch && !(options.fetch instanceof Array)) {
+      throw new Error(allowOrDeny + ": Value for `fetch` must be an array");
+    }
+    collection._updateFetch(options.fetch);
+  }
+}
+
+function throwIfSelectorIsNotId(selector, methodName) {
+  if (!LocalCollection._selectorIsIdPerhapsAsObject(selector)) {
+    throw new Meteor.Error(
+      403, "Not permitted. Untrusted code may only " + methodName +
+        " documents by ID.");
+  }
+};
+
+// Determine if we are in a DDP method simulation
+function alreadyInSimulation() {
+  const enclosing = DDP._CurrentInvocation.get();
+  return enclosing && enclosing.isSimulation;
+}
+
+},{}],5:[function(require,module,exports){
 var asciiToArray = function (str) {
   var arr = Base64.newBinary(str.length);
   for (var i = 0; i < str.length; i++) {
@@ -269,7 +766,7 @@ Tinytest.add("base64 - non-text examples", function (test) {
   });
 });
 
-},{}],5:[function(require,module,exports){
+},{}],6:[function(require,module,exports){
 Tinytest.add("blaze-tools - token parsers", function (test) {
 
   var run = function (func, input, expected) {
@@ -349,7 +846,7 @@ Tinytest.add("blaze-tools - token parsers", function (test) {
   }, /Unterminated string literal/);
 });
 
-},{}],6:[function(require,module,exports){
+},{}],7:[function(require,module,exports){
 var toCode = BlazeTools.toJS;
 
 var P = HTML.P;
@@ -1039,7 +1536,7 @@ Tinytest.add("ui - attributes", function (test) {
              '<span title="M&amp;Ms">M&amp;M candies</span>');
 });
 
-},{}],7:[function(require,module,exports){
+},{}],8:[function(require,module,exports){
 if (Meteor.isClient) {
 
   Tinytest.add("blaze - view - callbacks", function (test) {
@@ -1100,7 +1597,625 @@ if (Meteor.isClient) {
 
 }
 
-},{}],8:[function(require,module,exports){
+},{}],9:[function(require,module,exports){
+// XXX docs
+
+// Things we explicitly do NOT support:
+//    - heterogenous arrays
+
+var currentArgumentChecker = new Meteor.EnvironmentVariable;
+
+/**
+ * @summary Check that a value matches a [pattern](#matchpatterns).
+ * If the value does not match the pattern, throw a `Match.Error`.
+ *
+ * Particularly useful to assert that arguments to a function have the right
+ * types and structure.
+ * @locus Anywhere
+ * @param {Any} value The value to check
+ * @param {MatchPattern} pattern The pattern to match
+ * `value` against
+ */
+check = function (value, pattern) {
+  // Record that check got called, if somebody cared.
+  //
+  // We use getOrNullIfOutsideFiber so that it's OK to call check()
+  // from non-Fiber server contexts; the downside is that if you forget to
+  // bindEnvironment on some random callback in your method/publisher,
+  // it might not find the argumentChecker and you'll get an error about
+  // not checking an argument that it looks like you're checking (instead
+  // of just getting a "Node code must run in a Fiber" error).
+  var argChecker = currentArgumentChecker.getOrNullIfOutsideFiber();
+  if (argChecker)
+    argChecker.checking(value);
+  var result = testSubtree(value, pattern);
+  if (result) {
+    var err = new Match.Error(result.message);
+    if (result.path) {
+      err.message += " in field " + result.path;
+      err.path = result.path;
+    }
+    throw err;
+  }
+};
+
+/**
+ * @namespace Match
+ * @summary The namespace for all Match types and methods.
+ */
+Match = {
+  Optional: function (pattern) {
+    return new Optional(pattern);
+  },
+  Maybe: function (pattern) {
+    return new Maybe(pattern);
+  },
+  OneOf: function (/*arguments*/) {
+    return new OneOf(_.toArray(arguments));
+  },
+  Any: ['__any__'],
+  Where: function (condition) {
+    return new Where(condition);
+  },
+  ObjectIncluding: function (pattern) {
+    return new ObjectIncluding(pattern);
+  },
+  ObjectWithValues: function (pattern) {
+    return new ObjectWithValues(pattern);
+  },
+  // Matches only signed 32-bit integers
+  Integer: ['__integer__'],
+
+  // XXX matchers should know how to describe themselves for errors
+  Error: Meteor.makeErrorType("Match.Error", function (msg) {
+    this.message = "Match error: " + msg;
+    // The path of the value that failed to match. Initially empty, this gets
+    // populated by catching and rethrowing the exception as it goes back up the
+    // stack.
+    // E.g.: "vals[3].entity.created"
+    this.path = "";
+    // If this gets sent over DDP, don't give full internal details but at least
+    // provide something better than 500 Internal server error.
+    this.sanitizedError = new Meteor.Error(400, "Match failed");
+  }),
+
+  // Tests to see if value matches pattern. Unlike check, it merely returns true
+  // or false (unless an error other than Match.Error was thrown). It does not
+  // interact with _failIfArgumentsAreNotAllChecked.
+  // XXX maybe also implement a Match.match which returns more information about
+  //     failures but without using exception handling or doing what check()
+  //     does with _failIfArgumentsAreNotAllChecked and Meteor.Error conversion
+
+  /**
+   * @summary Returns true if the value matches the pattern.
+   * @locus Anywhere
+   * @param {Any} value The value to check
+   * @param {MatchPattern} pattern The pattern to match `value` against
+   */
+  test: function (value, pattern) {
+    return !testSubtree(value, pattern);
+  },
+
+  // Runs `f.apply(context, args)`. If check() is not called on every element of
+  // `args` (either directly or in the first level of an array), throws an error
+  // (using `description` in the message).
+  //
+  _failIfArgumentsAreNotAllChecked: function (f, context, args, description) {
+    var argChecker = new ArgumentChecker(args, description);
+    var result = currentArgumentChecker.withValue(argChecker, function () {
+      return f.apply(context, args);
+    });
+    // If f didn't itself throw, make sure it checked all of its arguments.
+    argChecker.throwUnlessAllArgumentsHaveBeenChecked();
+    return result;
+  }
+};
+
+var Optional = function (pattern) {
+  this.pattern = pattern;
+};
+
+var Maybe = Optional;
+
+var OneOf = function (choices) {
+  if (_.isEmpty(choices))
+    throw new Error("Must provide at least one choice to Match.OneOf");
+  this.choices = choices;
+};
+
+var Where = function (condition) {
+  this.condition = condition;
+};
+
+var ObjectIncluding = function (pattern) {
+  this.pattern = pattern;
+};
+
+var ObjectWithValues = function (pattern) {
+  this.pattern = pattern;
+};
+
+var typeofChecks = [
+  [String, "string"],
+  [Number, "number"],
+  [Boolean, "boolean"],
+  // While we don't allow undefined in EJSON, this is good for optional
+  // arguments with OneOf.
+  [undefined, "undefined"]
+];
+
+// Return `false` if it matches. Otherwise, return an object with a `message` and a `path` field.
+var testSubtree = function (value, pattern) {
+  // Match anything!
+  if (pattern === Match.Any)
+    return false;
+
+  // Basic atomic types.
+  // Do not match boxed objects (e.g. String, Boolean)
+  for (var i = 0; i < typeofChecks.length; ++i) {
+    if (pattern === typeofChecks[i][0]) {
+      if (typeof value === typeofChecks[i][1])
+        return false;
+      return {
+        message: "Expected " + typeofChecks[i][1] + ", got " + (value === null ? "null" : typeof value),
+        path: ""
+      };
+    }
+  }
+  if (pattern === null) {
+    if (value === null)
+      return false;
+    return {
+      message: "Expected null, got " + EJSON.stringify(value),
+      path: ""
+    };
+  }
+
+  // Strings, numbers, and booleans match literally. Goes well with Match.OneOf.
+  if (typeof pattern === "string" || typeof pattern === "number" || typeof pattern === "boolean") {
+    if (value === pattern)
+      return false;
+    return {
+      message: "Expected " + pattern + ", got " + EJSON.stringify(value),
+      path: ""
+    };
+  }
+
+  // Match.Integer is special type encoded with array
+  if (pattern === Match.Integer) {
+    // There is no consistent and reliable way to check if variable is a 64-bit
+    // integer. One of the popular solutions is to get reminder of division by 1
+    // but this method fails on really large floats with big precision.
+    // E.g.: 1.348192308491824e+23 % 1 === 0 in V8
+    // Bitwise operators work consistantly but always cast variable to 32-bit
+    // signed integer according to JavaScript specs.
+    if (typeof value === "number" && (value | 0) === value)
+      return false;
+    return {
+      message: "Expected Integer, got " + (value instanceof Object ? EJSON.stringify(value) : value),
+      path: ""
+    };
+  }
+
+  // "Object" is shorthand for Match.ObjectIncluding({});
+  if (pattern === Object)
+    pattern = Match.ObjectIncluding({});
+
+  // Array (checked AFTER Any, which is implemented as an Array).
+  if (pattern instanceof Array) {
+    if (pattern.length !== 1) {
+      return {
+        message: "Bad pattern: arrays must have one type element" + EJSON.stringify(pattern),
+        path: ""
+      };
+    }
+    if (!_.isArray(value) && !_.isArguments(value)) {
+      return {
+        message: "Expected array, got " + EJSON.stringify(value),
+        path: ""
+      };
+    }
+
+    for (var i = 0, length = value.length; i < length; i++) {
+      var result = testSubtree(value[i], pattern[0]);
+      if (result) {
+        result.path = _prependPath(i, result.path);
+        return result;
+      }
+    }
+    return false;
+  }
+
+  // Arbitrary validation checks. The condition can return false or throw a
+  // Match.Error (ie, it can internally use check()) to fail.
+  if (pattern instanceof Where) {
+    var result;
+    try {
+      result = pattern.condition(value);
+    } catch (err) {
+      if (!(err instanceof Match.Error))
+        throw err;
+      return {
+        message: err.message,
+        path: err.path
+      };
+    }
+    if (result)
+      return false;
+    // XXX this error is terrible
+    return {
+      message: "Failed Match.Where validation",
+      path: ""
+    };
+  }
+
+
+  if (pattern instanceof Maybe) {
+    pattern = Match.OneOf(undefined, null, pattern.pattern);
+  }
+  else if (pattern instanceof Optional) {
+    pattern = Match.OneOf(undefined, pattern.pattern);
+  }
+
+  if (pattern instanceof OneOf) {
+    for (var i = 0; i < pattern.choices.length; ++i) {
+      var result = testSubtree(value, pattern.choices[i]);
+      if (!result) {
+        // No error? Yay, return.
+        return false;
+      }
+      // Match errors just mean try another choice.
+    }
+    // XXX this error is terrible
+    return {
+      message: "Failed Match.OneOf, Match.Maybe or Match.Optional validation",
+      path: ""
+    };
+  }
+
+  // A function that isn't something we special-case is assumed to be a
+  // constructor.
+  if (pattern instanceof Function) {
+    if (value instanceof pattern)
+      return false;
+    return {
+      message: "Expected " + (pattern.name ||"particular constructor"),
+      path: ""
+    };
+  }
+
+  var unknownKeysAllowed = false;
+  var unknownKeyPattern;
+  if (pattern instanceof ObjectIncluding) {
+    unknownKeysAllowed = true;
+    pattern = pattern.pattern;
+  }
+  if (pattern instanceof ObjectWithValues) {
+    unknownKeysAllowed = true;
+    unknownKeyPattern = [pattern.pattern];
+    pattern = {};  // no required keys
+  }
+
+  if (typeof pattern !== "object") {
+    return {
+      message: "Bad pattern: unknown pattern type",
+      path: ""
+    };
+  }
+
+  // An object, with required and optional keys. Note that this does NOT do
+  // structural matches against objects of special types that happen to match
+  // the pattern: this really needs to be a plain old {Object}!
+  if (typeof value !== 'object') {
+    return {
+      message: "Expected object, got " + typeof value,
+      path: ""
+    };
+  }
+  if (value === null) {
+    return {
+      message: "Expected object, got null",
+      path: ""
+    };
+  }
+  if (! jQuery.isPlainObject(value)) {
+    return {
+      message: "Expected plain object",
+      path: ""
+    };
+  }
+
+  var requiredPatterns = {};
+  var optionalPatterns = {};
+  _.each(pattern, function (subPattern, key) {
+    if (subPattern instanceof Optional || subPattern instanceof Maybe)
+      optionalPatterns[key] = subPattern.pattern;
+    else
+      requiredPatterns[key] = subPattern;
+  });
+
+  //XXX: replace with underscore's _.allKeys if Meteor updates underscore to 1.8+ (or lodash)
+  var allKeys = function(obj){
+    var keys = [];
+    if (_.isObject(obj)){
+      for (var key in obj) keys.push(key);
+    }
+    return keys;
+  }
+
+  for (var keys = allKeys(value), i = 0, length = keys.length; i < length; i++) {
+    var key = keys[i];
+    var subValue = value[key];
+    if (_.has(requiredPatterns, key)) {
+      var result = testSubtree(subValue, requiredPatterns[key]);
+      if (result) {
+        result.path = _prependPath(key, result.path);
+        return result;
+      }
+      delete requiredPatterns[key];
+    } else if (_.has(optionalPatterns, key)) {
+      var result = testSubtree(subValue, optionalPatterns[key]);
+      if (result) {
+        result.path = _prependPath(key, result.path);
+        return result;
+      }
+    } else {
+      if (!unknownKeysAllowed) {
+        return {
+          message: "Unknown key",
+          path: key
+        };
+      }
+      if (unknownKeyPattern) {
+        var result = testSubtree(subValue, unknownKeyPattern[0]);
+        if (result) {
+          result.path = _prependPath(key, result.path);
+          return result;
+        }
+      }
+    }
+  }
+
+  var keys = _.keys(requiredPatterns);
+  if (keys.length) {
+    return {
+      message: "Missing key '" + keys[0] + "'",
+      path: ""
+    };
+  }
+};
+
+var ArgumentChecker = function (args, description) {
+  var self = this;
+  // Make a SHALLOW copy of the arguments. (We'll be doing identity checks
+  // against its contents.)
+  self.args = _.clone(args);
+  // Since the common case will be to check arguments in order, and we splice
+  // out arguments when we check them, make it so we splice out from the end
+  // rather than the beginning.
+  self.args.reverse();
+  self.description = description;
+};
+
+_.extend(ArgumentChecker.prototype, {
+  checking: function (value) {
+    var self = this;
+    if (self._checkingOneValue(value))
+      return;
+    // Allow check(arguments, [String]) or check(arguments.slice(1), [String])
+    // or check([foo, bar], [String]) to count... but only if value wasn't
+    // itself an argument.
+    if (_.isArray(value) || _.isArguments(value)) {
+      _.each(value, _.bind(self._checkingOneValue, self));
+    }
+  },
+  _checkingOneValue: function (value) {
+    var self = this;
+    for (var i = 0; i < self.args.length; ++i) {
+      // Is this value one of the arguments? (This can have a false positive if
+      // the argument is an interned primitive, but it's still a good enough
+      // check.)
+      // (NaN is not === to itself, so we have to check specially.)
+      if (value === self.args[i] || (_.isNaN(value) && _.isNaN(self.args[i]))) {
+        self.args.splice(i, 1);
+        return true;
+      }
+    }
+    return false;
+  },
+  throwUnlessAllArgumentsHaveBeenChecked: function () {
+    var self = this;
+    if (!_.isEmpty(self.args))
+      throw new Error("Did not check() all arguments during " +
+                      self.description);
+  }
+});
+
+var _jsKeywords = ["do", "if", "in", "for", "let", "new", "try", "var", "case",
+  "else", "enum", "eval", "false", "null", "this", "true", "void", "with",
+  "break", "catch", "class", "const", "super", "throw", "while", "yield",
+  "delete", "export", "import", "public", "return", "static", "switch",
+  "typeof", "default", "extends", "finally", "package", "private", "continue",
+  "debugger", "function", "arguments", "interface", "protected", "implements",
+  "instanceof"];
+
+// Assumes the base of path is already escaped properly
+// returns key + base
+var _prependPath = function (key, base) {
+  if ((typeof key) === "number" || key.match(/^[0-9]+$/))
+    key = "[" + key + "]";
+  else if (!key.match(/^[a-z_$][0-9a-z_$]*$/i) || _.contains(_jsKeywords, key))
+    key = JSON.stringify([key]);
+
+  if (base && base[0] !== "[")
+    return key + '.' + base;
+  return key + base;
+};
+
+
+},{}],10:[function(require,module,exports){
+Tinytest.add("diff-sequence - diff changes ordering", function (test) {
+  var makeDocs = function (ids) {
+    return _.map(ids, function (id) { return {_id: id};});
+  };
+  var testMutation = function (a, b) {
+    var aa = makeDocs(a);
+    var bb = makeDocs(b);
+    var aaCopy = EJSON.clone(aa);
+    DiffSequence.diffQueryOrderedChanges(aa, bb, {
+
+      addedBefore: function (id, doc, before) {
+        if (before === null) {
+          aaCopy.push( _.extend({_id: id}, doc));
+          return;
+        }
+        for (var i = 0; i < aaCopy.length; i++) {
+          if (aaCopy[i]._id === before) {
+            aaCopy.splice(i, 0, _.extend({_id: id}, doc));
+            return;
+          }
+        }
+      },
+      movedBefore: function (id, before) {
+        var found;
+        for (var i = 0; i < aaCopy.length; i++) {
+          if (aaCopy[i]._id === id) {
+            found = aaCopy[i];
+            aaCopy.splice(i, 1);
+          }
+        }
+        if (before === null) {
+          aaCopy.push( _.extend({_id: id}, found));
+          return;
+        }
+        for (i = 0; i < aaCopy.length; i++) {
+          if (aaCopy[i]._id === before) {
+            aaCopy.splice(i, 0, _.extend({_id: id}, found));
+            return;
+          }
+        }
+      },
+      removed: function (id) {
+        var found;
+        for (var i = 0; i < aaCopy.length; i++) {
+          if (aaCopy[i]._id === id) {
+            found = aaCopy[i];
+            aaCopy.splice(i, 1);
+          }
+        }
+      }
+    });
+    test.equal(aaCopy, bb);
+  };
+
+  var testBothWays = function (a, b) {
+    testMutation(a, b);
+    testMutation(b, a);
+  };
+
+  testBothWays(["a", "b", "c"], ["c", "b", "a"]);
+  testBothWays(["a", "b", "c"], []);
+  testBothWays(["a", "b", "c"], ["e","f"]);
+  testBothWays(["a", "b", "c", "d"], ["c", "b", "a"]);
+  testBothWays(['A','B','C','D','E','F','G','H','I'],
+               ['A','B','F','G','C','D','I','L','M','N','H']);
+  testBothWays(['A','B','C','D','E','F','G','H','I'],['A','B','C','D','F','G','H','E','I']);
+});
+
+Tinytest.add("diff-sequence - diff", function (test) {
+
+  // test correctness
+
+  var diffTest = function(origLen, newOldIdx) {
+    var oldResults = new Array(origLen);
+    for (var i = 1; i <= origLen; i++)
+      oldResults[i-1] = {_id: i};
+
+    var newResults = _.map(newOldIdx, function(n) {
+      var doc = {_id: Math.abs(n)};
+      if (n < 0)
+        doc.changed = true;
+      return doc;
+    });
+    var find = function (arr, id) {
+      for (var i = 0; i < arr.length; i++) {
+        if (EJSON.equals(arr[i]._id, id))
+          return i;
+      }
+      return -1;
+    };
+
+    var results = _.clone(oldResults);
+    var observer = {
+      addedBefore: function(id, fields, before) {
+        var before_idx;
+        if (before === null)
+          before_idx = results.length;
+        else
+          before_idx = find (results, before);
+        var doc = _.extend({_id: id}, fields);
+        test.isFalse(before_idx < 0 || before_idx > results.length);
+        results.splice(before_idx, 0, doc);
+      },
+      removed: function(id) {
+        var at_idx = find (results, id);
+        test.isFalse(at_idx < 0 || at_idx >= results.length);
+        results.splice(at_idx, 1);
+      },
+      changed: function(id, fields) {
+        var at_idx = find (results, id);
+        var oldDoc = results[at_idx];
+        var doc = EJSON.clone(oldDoc);
+        DiffSequence.applyChanges(doc, fields);
+        test.isFalse(at_idx < 0 || at_idx >= results.length);
+        test.equal(doc._id, oldDoc._id);
+        results[at_idx] = doc;
+      },
+      movedBefore: function(id, before) {
+        var old_idx = find(results, id);
+        var new_idx;
+        if (before === null)
+          new_idx = results.length;
+        else
+          new_idx = find (results, before);
+        if (new_idx > old_idx)
+          new_idx--;
+        test.isFalse(old_idx < 0 || old_idx >= results.length);
+        test.isFalse(new_idx < 0 || new_idx >= results.length);
+        results.splice(new_idx, 0, results.splice(old_idx, 1)[0]);
+      }
+    };
+
+    DiffSequence.diffQueryOrderedChanges(oldResults, newResults, observer);
+    test.equal(results, newResults);
+  };
+
+  // edge cases and cases run into during debugging
+  diffTest(5, [5, 1, 2, 3, 4]);
+  diffTest(0, [1, 2, 3, 4]);
+  diffTest(4, []);
+  diffTest(7, [4, 5, 6, 7, 1, 2, 3]);
+  diffTest(7, [5, 6, 7, 1, 2, 3, 4]);
+  diffTest(10, [7, 4, 11, 6, 12, 1, 5]);
+  diffTest(3, [3, 2, 1]);
+  diffTest(10, [2, 7, 4, 6, 11, 3, 8, 9]);
+  diffTest(0, []);
+  diffTest(1, []);
+  diffTest(0, [1]);
+  diffTest(1, [1]);
+  diffTest(5, [1, 2, 3, 4, 5]);
+
+  // interaction between "changed" and other ops
+  diffTest(5, [-5, -1, 2, -3, 4]);
+  diffTest(7, [-4, -5, 6, 7, -1, 2, 3]);
+  diffTest(7, [5, 6, -7, 1, 2, -3, 4]);
+  diffTest(10, [7, -4, 11, 6, 12, -1, 5]);
+  diffTest(3, [-3, -2, -1]);
+  diffTest(10, [-2, 7, 4, 6, 11, -3, -8, 9]);
+});
+
+
+},{}],11:[function(require,module,exports){
 function Address (city, state) {
   this.city = city;
   this.state = state;
@@ -1189,7 +2304,7 @@ _.extend(EJSONTest, {
   Holder: Holder
 });
 
-},{}],9:[function(require,module,exports){
+},{}],12:[function(require,module,exports){
 Tinytest.add("ejson - keyOrderSensitive", function (test) {
   test.isTrue(EJSON.equals({
     a: {b: 1, c: 2},
@@ -1423,7 +2538,389 @@ Tinytest.add("ejson - custom types", function (test) {
   test.notEqual( obj, clone );
 });
 
-},{}],10:[function(require,module,exports){
+},{}],13:[function(require,module,exports){
+(function () {
+  var gju = {};
+
+  // Export the geojson object for **CommonJS**
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = gju;
+  }
+
+  // adapted from http://www.kevlindev.com/gui/math/intersection/Intersection.js
+  gju.lineStringsIntersect = function (l1, l2) {
+    var intersects = [];
+    for (var i = 0; i <= l1.coordinates.length - 2; ++i) {
+      for (var j = 0; j <= l2.coordinates.length - 2; ++j) {
+        var a1 = {
+          x: l1.coordinates[i][1],
+          y: l1.coordinates[i][0]
+        },
+          a2 = {
+            x: l1.coordinates[i + 1][1],
+            y: l1.coordinates[i + 1][0]
+          },
+          b1 = {
+            x: l2.coordinates[j][1],
+            y: l2.coordinates[j][0]
+          },
+          b2 = {
+            x: l2.coordinates[j + 1][1],
+            y: l2.coordinates[j + 1][0]
+          },
+          ua_t = (b2.x - b1.x) * (a1.y - b1.y) - (b2.y - b1.y) * (a1.x - b1.x),
+          ub_t = (a2.x - a1.x) * (a1.y - b1.y) - (a2.y - a1.y) * (a1.x - b1.x),
+          u_b = (b2.y - b1.y) * (a2.x - a1.x) - (b2.x - b1.x) * (a2.y - a1.y);
+        if (u_b != 0) {
+          var ua = ua_t / u_b,
+            ub = ub_t / u_b;
+          if (0 <= ua && ua <= 1 && 0 <= ub && ub <= 1) {
+            intersects.push({
+              'type': 'Point',
+              'coordinates': [a1.x + ua * (a2.x - a1.x), a1.y + ua * (a2.y - a1.y)]
+            });
+          }
+        }
+      }
+    }
+    if (intersects.length == 0) intersects = false;
+    return intersects;
+  }
+
+  // Bounding Box
+
+  function boundingBoxAroundPolyCoords (coords) {
+    var xAll = [], yAll = []
+
+    for (var i = 0; i < coords[0].length; i++) {
+      xAll.push(coords[0][i][1])
+      yAll.push(coords[0][i][0])
+    }
+
+    xAll = xAll.sort(function (a,b) { return a - b })
+    yAll = yAll.sort(function (a,b) { return a - b })
+
+    return [ [xAll[0], yAll[0]], [xAll[xAll.length - 1], yAll[yAll.length - 1]] ]
+  }
+
+  gju.pointInBoundingBox = function (point, bounds) {
+    return !(point.coordinates[1] < bounds[0][0] || point.coordinates[1] > bounds[1][0] || point.coordinates[0] < bounds[0][1] || point.coordinates[0] > bounds[1][1]) 
+  }
+
+  // Point in Polygon
+  // http://www.ecse.rpi.edu/Homepages/wrf/Research/Short_Notes/pnpoly.html#Listing the Vertices
+
+  function pnpoly (x,y,coords) {
+    var vert = [ [0,0] ]
+
+    for (var i = 0; i < coords.length; i++) {
+      for (var j = 0; j < coords[i].length; j++) {
+        vert.push(coords[i][j])
+      }
+      vert.push([0,0])
+    }
+
+    var inside = false
+    for (var i = 0, j = vert.length - 1; i < vert.length; j = i++) {
+      if (((vert[i][0] > y) != (vert[j][0] > y)) && (x < (vert[j][1] - vert[i][1]) * (y - vert[i][0]) / (vert[j][0] - vert[i][0]) + vert[i][1])) inside = !inside
+    }
+
+    return inside
+  }
+
+  gju.pointInPolygon = function (p, poly) {
+    var coords = (poly.type == "Polygon") ? [ poly.coordinates ] : poly.coordinates
+
+    var insideBox = false
+    for (var i = 0; i < coords.length; i++) {
+      if (gju.pointInBoundingBox(p, boundingBoxAroundPolyCoords(coords[i]))) insideBox = true
+    }
+    if (!insideBox) return false
+
+    var insidePoly = false
+    for (var i = 0; i < coords.length; i++) {
+      if (pnpoly(p.coordinates[1], p.coordinates[0], coords[i])) insidePoly = true
+    }
+
+    return insidePoly
+  }
+
+  gju.numberToRadius = function (number) {
+    return number * Math.PI / 180;
+  }
+
+  gju.numberToDegree = function (number) {
+    return number * 180 / Math.PI;
+  }
+
+  // written with help from @tautologe
+  gju.drawCircle = function (radiusInMeters, centerPoint, steps) {
+    var center = [centerPoint.coordinates[1], centerPoint.coordinates[0]],
+      dist = (radiusInMeters / 1000) / 6371,
+      // convert meters to radiant
+      radCenter = [gju.numberToRadius(center[0]), gju.numberToRadius(center[1])],
+      steps = steps || 15,
+      // 15 sided circle
+      poly = [[center[0], center[1]]];
+    for (var i = 0; i < steps; i++) {
+      var brng = 2 * Math.PI * i / steps;
+      var lat = Math.asin(Math.sin(radCenter[0]) * Math.cos(dist)
+              + Math.cos(radCenter[0]) * Math.sin(dist) * Math.cos(brng));
+      var lng = radCenter[1] + Math.atan2(Math.sin(brng) * Math.sin(dist) * Math.cos(radCenter[0]),
+                                          Math.cos(dist) - Math.sin(radCenter[0]) * Math.sin(lat));
+      poly[i] = [];
+      poly[i][1] = gju.numberToDegree(lat);
+      poly[i][0] = gju.numberToDegree(lng);
+    }
+    return {
+      "type": "Polygon",
+      "coordinates": [poly]
+    };
+  }
+
+  // assumes rectangle starts at lower left point
+  gju.rectangleCentroid = function (rectangle) {
+    var bbox = rectangle.coordinates[0];
+    var xmin = bbox[0][0],
+      ymin = bbox[0][1],
+      xmax = bbox[2][0],
+      ymax = bbox[2][1];
+    var xwidth = xmax - xmin;
+    var ywidth = ymax - ymin;
+    return {
+      'type': 'Point',
+      'coordinates': [xmin + xwidth / 2, ymin + ywidth / 2]
+    };
+  }
+
+  // from http://www.movable-type.co.uk/scripts/latlong.html
+  gju.pointDistance = function (pt1, pt2) {
+    var lon1 = pt1.coordinates[0],
+      lat1 = pt1.coordinates[1],
+      lon2 = pt2.coordinates[0],
+      lat2 = pt2.coordinates[1],
+      dLat = gju.numberToRadius(lat2 - lat1),
+      dLon = gju.numberToRadius(lon2 - lon1),
+      a = Math.pow(Math.sin(dLat / 2), 2) + Math.cos(gju.numberToRadius(lat1))
+        * Math.cos(gju.numberToRadius(lat2)) * Math.pow(Math.sin(dLon / 2), 2),
+      c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    // Earth radius is 6371 km
+    return (6371 * c) * 1000; // returns meters
+  },
+
+  // checks if geometry lies entirely within a circle
+  // works with Point, LineString, Polygon
+  gju.geometryWithinRadius = function (geometry, center, radius) {
+    if (geometry.type == 'Point') {
+      return gju.pointDistance(geometry, center) <= radius;
+    } else if (geometry.type == 'LineString' || geometry.type == 'Polygon') {
+      var point = {};
+      var coordinates;
+      if (geometry.type == 'Polygon') {
+        // it's enough to check the exterior ring of the Polygon
+        coordinates = geometry.coordinates[0];
+      } else {
+        coordinates = geometry.coordinates;
+      }
+      for (var i in coordinates) {
+        point.coordinates = coordinates[i];
+        if (gju.pointDistance(point, center) > radius) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  // adapted from http://paulbourke.net/geometry/polyarea/javascript.txt
+  gju.area = function (polygon) {
+    var area = 0;
+    // TODO: polygon holes at coordinates[1]
+    var points = polygon.coordinates[0];
+    var j = points.length - 1;
+    var p1, p2;
+
+    for (var i = 0; i < points.length; j = i++) {
+      var p1 = {
+        x: points[i][1],
+        y: points[i][0]
+      };
+      var p2 = {
+        x: points[j][1],
+        y: points[j][0]
+      };
+      area += p1.x * p2.y;
+      area -= p1.y * p2.x;
+    }
+
+    area /= 2;
+    return area;
+  },
+
+  // adapted from http://paulbourke.net/geometry/polyarea/javascript.txt
+  gju.centroid = function (polygon) {
+    var f, x = 0,
+      y = 0;
+    // TODO: polygon holes at coordinates[1]
+    var points = polygon.coordinates[0];
+    var j = points.length - 1;
+    var p1, p2;
+
+    for (var i = 0; i < points.length; j = i++) {
+      var p1 = {
+        x: points[i][1],
+        y: points[i][0]
+      };
+      var p2 = {
+        x: points[j][1],
+        y: points[j][0]
+      };
+      f = p1.x * p2.y - p2.x * p1.y;
+      x += (p1.x + p2.x) * f;
+      y += (p1.y + p2.y) * f;
+    }
+
+    f = gju.area(polygon) * 6;
+    return {
+      'type': 'Point',
+      'coordinates': [y / f, x / f]
+    };
+  },
+
+  gju.simplify = function (source, kink) { /* source[] array of geojson points */
+    /* kink	in metres, kinks above this depth kept  */
+    /* kink depth is the height of the triangle abc where a-b and b-c are two consecutive line segments */
+    kink = kink || 20;
+    source = source.map(function (o) {
+      return {
+        lng: o.coordinates[0],
+        lat: o.coordinates[1]
+      }
+    });
+
+    var n_source, n_stack, n_dest, start, end, i, sig;
+    var dev_sqr, max_dev_sqr, band_sqr;
+    var x12, y12, d12, x13, y13, d13, x23, y23, d23;
+    var F = (Math.PI / 180.0) * 0.5;
+    var index = new Array(); /* aray of indexes of source points to include in the reduced line */
+    var sig_start = new Array(); /* indices of start & end of working section */
+    var sig_end = new Array();
+
+    /* check for simple cases */
+
+    if (source.length < 3) return (source); /* one or two points */
+
+    /* more complex case. initialize stack */
+
+    n_source = source.length;
+    band_sqr = kink * 360.0 / (2.0 * Math.PI * 6378137.0); /* Now in degrees */
+    band_sqr *= band_sqr;
+    n_dest = 0;
+    sig_start[0] = 0;
+    sig_end[0] = n_source - 1;
+    n_stack = 1;
+
+    /* while the stack is not empty  ... */
+    while (n_stack > 0) {
+
+      /* ... pop the top-most entries off the stacks */
+
+      start = sig_start[n_stack - 1];
+      end = sig_end[n_stack - 1];
+      n_stack--;
+
+      if ((end - start) > 1) { /* any intermediate points ? */
+
+        /* ... yes, so find most deviant intermediate point to
+        either side of line joining start & end points */
+
+        x12 = (source[end].lng() - source[start].lng());
+        y12 = (source[end].lat() - source[start].lat());
+        if (Math.abs(x12) > 180.0) x12 = 360.0 - Math.abs(x12);
+        x12 *= Math.cos(F * (source[end].lat() + source[start].lat())); /* use avg lat to reduce lng */
+        d12 = (x12 * x12) + (y12 * y12);
+
+        for (i = start + 1, sig = start, max_dev_sqr = -1.0; i < end; i++) {
+
+          x13 = source[i].lng() - source[start].lng();
+          y13 = source[i].lat() - source[start].lat();
+          if (Math.abs(x13) > 180.0) x13 = 360.0 - Math.abs(x13);
+          x13 *= Math.cos(F * (source[i].lat() + source[start].lat()));
+          d13 = (x13 * x13) + (y13 * y13);
+
+          x23 = source[i].lng() - source[end].lng();
+          y23 = source[i].lat() - source[end].lat();
+          if (Math.abs(x23) > 180.0) x23 = 360.0 - Math.abs(x23);
+          x23 *= Math.cos(F * (source[i].lat() + source[end].lat()));
+          d23 = (x23 * x23) + (y23 * y23);
+
+          if (d13 >= (d12 + d23)) dev_sqr = d23;
+          else if (d23 >= (d12 + d13)) dev_sqr = d13;
+          else dev_sqr = (x13 * y12 - y13 * x12) * (x13 * y12 - y13 * x12) / d12; // solve triangle
+          if (dev_sqr > max_dev_sqr) {
+            sig = i;
+            max_dev_sqr = dev_sqr;
+          }
+        }
+
+        if (max_dev_sqr < band_sqr) { /* is there a sig. intermediate point ? */
+          /* ... no, so transfer current start point */
+          index[n_dest] = start;
+          n_dest++;
+        } else { /* ... yes, so push two sub-sections on stack for further processing */
+          n_stack++;
+          sig_start[n_stack - 1] = sig;
+          sig_end[n_stack - 1] = end;
+          n_stack++;
+          sig_start[n_stack - 1] = start;
+          sig_end[n_stack - 1] = sig;
+        }
+      } else { /* ... no intermediate points, so transfer current start point */
+        index[n_dest] = start;
+        n_dest++;
+      }
+    }
+
+    /* transfer last point */
+    index[n_dest] = n_source - 1;
+    n_dest++;
+
+    /* make return array */
+    var r = new Array();
+    for (var i = 0; i < n_dest; i++)
+      r.push(source[index[i]]);
+
+    return r.map(function (o) {
+      return {
+        type: "Point",
+        coordinates: [o.lng, o.lat]
+      }
+    });
+  }
+
+  // http://www.movable-type.co.uk/scripts/latlong.html#destPoint
+  gju.destinationPoint = function (pt, brng, dist) {
+    dist = dist/6371;  // convert dist to angular distance in radians
+    brng = gju.numberToRadius(brng);
+
+    var lat1 = gju.numberToRadius(pt.coordinates[0]);
+    var lon1 = gju.numberToRadius(pt.coordinates[1]);
+
+    var lat2 = Math.asin( Math.sin(lat1)*Math.cos(dist) +
+                          Math.cos(lat1)*Math.sin(dist)*Math.cos(brng) );
+    var lon2 = lon1 + Math.atan2(Math.sin(brng)*Math.sin(dist)*Math.cos(lat1),
+                                 Math.cos(dist)-Math.sin(lat1)*Math.sin(lat2));
+    lon2 = (lon2+3*Math.PI) % (2*Math.PI) - Math.PI;  // normalise to -180..+180º
+
+    return {
+      'type': 'Point',
+      'coordinates': [gju.numberToDegree(lat2), gju.numberToDegree(lon2)]
+    };
+  };
+
+})();
+
+},{}],14:[function(require,module,exports){
 var Scanner = HTMLTools.Scanner;
 var getCharacterReference = HTMLTools.Parse.getCharacterReference;
 
@@ -1539,7 +3036,7 @@ Tinytest.add("html-tools - entities", function (test) {
 
 });
 
-},{}],11:[function(require,module,exports){
+},{}],15:[function(require,module,exports){
 var Scanner = HTMLTools.Scanner;
 var getContent = HTMLTools.Parse.getContent;
 
@@ -1945,7 +3442,7 @@ Tinytest.add("html-tools - getTemplateTag", function (test) {
 
 });
 
-},{}],12:[function(require,module,exports){
+},{}],16:[function(require,module,exports){
 var Scanner = HTMLTools.Scanner;
 var getComment = HTMLTools.Parse.getComment;
 var getDoctype = HTMLTools.Parse.getDoctype;
@@ -2291,7 +3788,7 @@ Tinytest.add("html-tools - tokenize", function (test) {
   fatal('</a  />');
 });
 
-},{}],13:[function(require,module,exports){
+},{}],17:[function(require,module,exports){
 
 Tinytest.add("htmljs - getTag", function (test) {
   var FOO = HTML.getTag('foo');
@@ -2380,13 +3877,4717 @@ Tinytest.add("htmljs - details", function (test) {
   test.equal(HTML.toHTML(false), "false");
 });
 
-},{}],14:[function(require,module,exports){
+},{}],18:[function(require,module,exports){
 Tinytest.add("environment - client basics", function (test) {
   test.isTrue(Meteor.isClient);
   test.isFalse(Meteor.isServer);
 });
 
-},{}],15:[function(require,module,exports){
+},{}],19:[function(require,module,exports){
+Tinytest.add("environment - helpers", function (test) {
+  /*** ensure ***/
+  var x = {};
+  var y = Meteor._ensure(x, "a", "b", "c");
+  test.equal(x, {a: {b: {c: {}}}});
+  test.equal(y, {});
+  y.d = 12;
+  test.equal(x, {a: {b: {c: {d: 12}}}});
+  test.equal(y, {d: 12});
+
+  y = Meteor._ensure(x, "a", "b", "c");
+  test.equal(x, {a: {b: {c: {d: 12}}}});
+  test.equal(y, {d: 12});
+  y.x = 13;
+  test.equal(x, {a: {b: {c: {d: 12, x: 13}}}});
+  test.equal(y, {d: 12, x: 13});
+
+  y = Meteor._ensure(x, "a", "n");
+  test.equal(x, {a: {b: {c: {d: 12, x: 13}}, n: {}}});
+  test.equal(y, {});
+  y.d = 22;
+  test.equal(x, {a: {b: {c: {d: 12, x: 13}}, n: {d: 22}}});
+  test.equal(y, {d: 22});
+
+  Meteor._ensure(x, "a", "q", "r")["s"] = 99
+  test.equal(x, {a: {b: {c: {d: 12, x: 13}}, n: {d: 22}, q: {r: {s: 99}}}});
+
+  Meteor._ensure(x, "b")["z"] = 44;
+  test.equal(x, {a: {b: {c: {d: 12, x: 13}}, n: {d: 22}, q: {r: {s: 99}}},
+                 b: {z: 44}});
+
+  /*** delete ***/
+
+  x = {};
+  Meteor._delete(x, "a", "b", "c");
+  test.equal(x, {});
+
+  x = {a: {b: {}}};
+  Meteor._delete(x, "a", "b", "c");
+  test.equal(x, {});
+
+  x = {a: {b: {}, n: {}}};
+  Meteor._delete(x, "a", "b", "c");
+  test.equal(x, {a: {n: {}}});
+
+  x = {a: {b: {}}, n: {}};
+  Meteor._delete(x, "a", "b", "c");
+  test.equal(x, {n: {}});
+
+  x = {a: {b: 99}};
+  Meteor._delete(x, "a", "b", "c");
+  test.equal(x, {});
+
+  x = {a: {b: 99}};
+  Meteor._delete(x, "a", "b", "c", "d");
+  test.equal(x, {});
+
+  x = {a: {b: 99}};
+  Meteor._delete(x, "a", "b", "c", "d", "e", "f");
+  test.equal(x, {});
+
+  x = {a: {b: {c: {d: 99}}}, x: 12};
+  Meteor._delete(x, "a", "b", "c", "d");
+  test.equal(x, {x: 12});
+
+  x = {a: {b: {c: {d: 99}}, x: 12}};
+  Meteor._delete(x, "a", "b", "c", "d");
+  test.equal(x, {a: {x: 12}});
+
+  x = {a: 12, b: 13};
+  Meteor._delete(x, "a");
+  test.equal(x, {b: 13});
+
+  x = {a: 12};
+  Meteor._delete(x, "a");
+  test.equal(x, {});
+
+  /*** inherits ***/
+  var Parent = function () {};
+  Parent.parentStaticProp = true;
+  Parent.prototype.parentProp = true;
+
+  var Child = function () {};
+  Meteor._inherits(Child, Parent);
+
+  Child.prototype.childProp = true;
+
+  test.isTrue(Child.parentStaticProp, 'copy parent static props');
+  test.equal(Child.__super__, Parent.prototype, '__super__ is set');
+
+  var c = new Child;
+  test.isTrue(c.parentProp, 'prototype chain hooked up correctly');
+});
+
+Tinytest.add("environment - startup", function (test) {
+  // After startup, Meteor.startup should call the callback immediately.
+  var called = false;
+  Meteor.startup(function () {
+    called = true;
+  });
+  test.isTrue(called);
+});
+
+},{}],20:[function(require,module,exports){
+Tinytest.addAsync('timers - defer', function (test, onComplete) {
+  var x = 'a';
+  Meteor.defer(function () {
+    test.equal(x, 'b');
+    onComplete();
+  });
+  x = 'b';
+});
+
+Tinytest.addAsync('timers - nested defer', function (test, onComplete) {
+  var x = 'a';
+  Meteor.defer(function () {
+    test.equal(x, 'b');
+    Meteor.defer(function () {
+      test.equal(x, 'c');
+      onComplete();
+    });
+    x = 'c';
+  });
+  x = 'b';
+});
+
+},{}],21:[function(require,module,exports){
+
+// Hack to make LocalCollection generate ObjectIDs by default.
+LocalCollection._useOID = true;
+
+// assert that f is a strcmp-style comparison function that puts
+// 'values' in the provided order
+
+var assert_ordering = function (test, f, values) {
+  for (var i = 0; i < values.length; i++) {
+    var x = f(values[i], values[i]);
+    if (x !== 0) {
+      // XXX super janky
+      test.fail({type: "minimongo-ordering",
+                 message: "value doesn't order as equal to itself",
+                 value: JSON.stringify(values[i]),
+                 should_be_zero_but_got: JSON.stringify(x)});
+    }
+    if (i + 1 < values.length) {
+      var less = values[i];
+      var more = values[i + 1];
+      var x = f(less, more);
+      if (!(x < 0)) {
+        // XXX super janky
+        test.fail({type: "minimongo-ordering",
+                   message: "ordering test failed",
+                   first: JSON.stringify(less),
+                   second: JSON.stringify(more),
+                   should_be_negative_but_got: JSON.stringify(x)});
+      }
+      x = f(more, less);
+      if (!(x > 0)) {
+        // XXX super janky
+        test.fail({type: "minimongo-ordering",
+                   message: "ordering test failed",
+                   first: JSON.stringify(less),
+                   second: JSON.stringify(more),
+                   should_be_positive_but_got: JSON.stringify(x)});
+      }
+    }
+  }
+};
+
+var log_callbacks = function (operations) {
+  return {
+    addedAt: function (obj, idx, before) {
+      delete obj._id;
+      operations.push(EJSON.clone(['added', obj, idx, before]));
+    },
+    changedAt: function (obj, old_obj, at) {
+      delete obj._id;
+      delete old_obj._id;
+      operations.push(EJSON.clone(['changed', obj, at, old_obj]));
+    },
+    movedTo: function (obj, old_at, new_at, before) {
+      delete obj._id;
+      operations.push(EJSON.clone(['moved', obj, old_at, new_at, before]));
+    },
+    removedAt: function (old_obj, at) {
+      var id = old_obj._id;
+      delete old_obj._id;
+      operations.push(EJSON.clone(['removed', id, at, old_obj]));
+    }
+  };
+};
+
+// XXX test shared structure in all MM entrypoints
+Tinytest.add("minimongo - basics", function (test) {
+  var c = new LocalCollection(),
+      fluffyKitten_id,
+      count;
+
+  fluffyKitten_id = c.insert({type: "kitten", name: "fluffy"});
+  c.insert({type: "kitten", name: "snookums"});
+  c.insert({type: "cryptographer", name: "alice"});
+  c.insert({type: "cryptographer", name: "bob"});
+  c.insert({type: "cryptographer", name: "cara"});
+  test.equal(c.find().count(), 5);
+  test.equal(c.find({type: "kitten"}).count(), 2);
+  test.equal(c.find({type: "cryptographer"}).count(), 3);
+  test.length(c.find({type: "kitten"}).fetch(), 2);
+  test.length(c.find({type: "cryptographer"}).fetch(), 3);
+  test.equal(fluffyKitten_id, c.findOne({type: "kitten", name: "fluffy"})._id);
+
+  c.remove({name: "cara"});
+  test.equal(c.find().count(), 4);
+  test.equal(c.find({type: "kitten"}).count(), 2);
+  test.equal(c.find({type: "cryptographer"}).count(), 2);
+  test.length(c.find({type: "kitten"}).fetch(), 2);
+  test.length(c.find({type: "cryptographer"}).fetch(), 2);
+
+  count = c.update({name: "snookums"}, {$set: {type: "cryptographer"}});
+  test.equal(count, 1);
+  test.equal(c.find().count(), 4);
+  test.equal(c.find({type: "kitten"}).count(), 1);
+  test.equal(c.find({type: "cryptographer"}).count(), 3);
+  test.length(c.find({type: "kitten"}).fetch(), 1);
+  test.length(c.find({type: "cryptographer"}).fetch(), 3);
+
+  c.remove(null);
+  c.remove(false);
+  c.remove(undefined);
+  test.equal(c.find().count(), 4);
+
+  c.remove({_id: null});
+  c.remove({_id: false});
+  c.remove({_id: undefined});
+  count = c.remove();
+  test.equal(count, 0);
+  test.equal(c.find().count(), 4);
+
+  count = c.remove({});
+  test.equal(count, 4);
+  test.equal(c.find().count(), 0);
+
+  c.insert({_id: 1, name: "strawberry", tags: ["fruit", "red", "squishy"]});
+  c.insert({_id: 2, name: "apple", tags: ["fruit", "red", "hard"]});
+  c.insert({_id: 3, name: "rose", tags: ["flower", "red", "squishy"]});
+
+  test.equal(c.find({tags: "flower"}).count(), 1);
+  test.equal(c.find({tags: "fruit"}).count(), 2);
+  test.equal(c.find({tags: "red"}).count(), 3);
+  test.length(c.find({tags: "flower"}).fetch(), 1);
+  test.length(c.find({tags: "fruit"}).fetch(), 2);
+  test.length(c.find({tags: "red"}).fetch(), 3);
+
+  test.equal(c.findOne(1).name, "strawberry");
+  test.equal(c.findOne(2).name, "apple");
+  test.equal(c.findOne(3).name, "rose");
+  test.equal(c.findOne(4), undefined);
+  test.equal(c.findOne("abc"), undefined);
+  test.equal(c.findOne(undefined), undefined);
+
+  test.equal(c.find(1).count(), 1);
+  test.equal(c.find(4).count(), 0);
+  test.equal(c.find("abc").count(), 0);
+  test.equal(c.find(undefined).count(), 0);
+  test.equal(c.find().count(), 3);
+  test.equal(c.find(1, {skip: 1}).count(), 0);
+  test.equal(c.find({_id: 1}, {skip: 1}).count(), 0);
+  test.equal(c.find({}, {skip: 1}).count(), 2);
+  test.equal(c.find({}, {skip: 2}).count(), 1);
+  test.equal(c.find({}, {limit: 2}).count(), 2);
+  test.equal(c.find({}, {limit: 1}).count(), 1);
+  test.equal(c.find({}, {skip: 1, limit: 1}).count(), 1);
+  test.equal(c.find({tags: "fruit"}, {skip: 1}).count(), 1);
+  test.equal(c.find({tags: "fruit"}, {limit: 1}).count(), 1);
+  test.equal(c.find({tags: "fruit"}, {skip: 1, limit: 1}).count(), 1);
+  test.equal(c.find(1, {sort: ['_id','desc'], skip: 1}).count(), 0);
+  test.equal(c.find({_id: 1}, {sort: ['_id','desc'], skip: 1}).count(), 0);
+  test.equal(c.find({}, {sort: ['_id','desc'], skip: 1}).count(), 2);
+  test.equal(c.find({}, {sort: ['_id','desc'], skip: 2}).count(), 1);
+  test.equal(c.find({}, {sort: ['_id','desc'], limit: 2}).count(), 2);
+  test.equal(c.find({}, {sort: ['_id','desc'], limit: 1}).count(), 1);
+  test.equal(c.find({}, {sort: ['_id','desc'], skip: 1, limit: 1}).count(), 1);
+  test.equal(c.find({tags: "fruit"}, {sort: ['_id','desc'], skip: 1}).count(), 1);
+  test.equal(c.find({tags: "fruit"}, {sort: ['_id','desc'], limit: 1}).count(), 1);
+  test.equal(c.find({tags: "fruit"}, {sort: ['_id','desc'], skip: 1, limit: 1}).count(), 1);
+
+  // Regression test for #455.
+  c.insert({foo: {bar: 'baz'}});
+  test.equal(c.find({foo: {bam: 'baz'}}).count(), 0);
+  test.equal(c.find({foo: {bar: 'baz'}}).count(), 1);
+
+});
+
+Tinytest.add("minimongo - cursors", function (test) {
+  var c = new LocalCollection();
+  var res;
+
+  for (var i = 0; i < 20; i++)
+    c.insert({i: i});
+
+  var q = c.find();
+  test.equal(q.count(), 20);
+
+  // fetch
+  res = q.fetch();
+  test.length(res, 20);
+  for (var i = 0; i < 20; i++) {
+    test.equal(res[i].i, i);
+  }
+  // call it again, it still works
+  test.length(q.fetch(), 20);
+
+  // forEach
+  var count = 0;
+  var context = {};
+  q.forEach(function (obj, i, cursor) {
+    test.equal(obj.i, count++);
+    test.equal(obj.i, i);
+    test.isTrue(context === this);
+    test.isTrue(cursor === q);
+  }, context);
+  test.equal(count, 20);
+  // call it again, it still works
+  test.length(q.fetch(), 20);
+
+  // map
+  res = q.map(function (obj, i, cursor) {
+    test.equal(obj.i, i);
+    test.isTrue(context === this);
+    test.isTrue(cursor === q);
+    return obj.i * 2;
+  }, context);
+  test.length(res, 20);
+  for (var i = 0; i < 20; i++)
+    test.equal(res[i], i * 2);
+  // call it again, it still works
+  test.length(q.fetch(), 20);
+
+  // findOne (and no rewind first)
+  test.equal(c.findOne({i: 0}).i, 0);
+  test.equal(c.findOne({i: 1}).i, 1);
+  var id = c.findOne({i: 2})._id;
+  test.equal(c.findOne(id).i, 2);
+});
+
+Tinytest.add("minimongo - transform", function (test) {
+  var c = new LocalCollection;
+  c.insert({});
+  // transform functions must return objects
+  var invalidTransform = function (doc) { return doc._id; };
+  test.throws(function () {
+    c.findOne({}, {transform: invalidTransform});
+  });
+
+  // transformed documents get _id field transplanted if not present
+  var transformWithoutId = function (doc) { return _.omit(doc, '_id'); };
+  test.equal(c.findOne({}, {transform: transformWithoutId})._id,
+             c.findOne()._id);
+});
+
+Tinytest.add("minimongo - misc", function (test) {
+  // deepcopy
+  var a = {a: [1, 2, 3], b: "x", c: true, d: {x: 12, y: [12]},
+           f: null, g: new Date()};
+  var b = EJSON.clone(a);
+  test.equal(a, b);
+  test.isTrue(LocalCollection._f._equal(a, b));
+  a.a.push(4);
+  test.length(b.a, 3);
+  a.c = false;
+  test.isTrue(b.c);
+  b.d.z = 15;
+  a.d.z = 14;
+  test.equal(b.d.z, 15);
+  a.d.y.push(88);
+  test.length(b.d.y, 1);
+  test.equal(a.g, b.g);
+  b.g.setDate(b.g.getDate() + 1);
+  test.notEqual(a.g, b.g);
+
+  a = {x: function () {}};
+  b = EJSON.clone(a);
+  a.x.a = 14;
+  test.equal(b.x.a, 14); // just to document current behavior
+});
+
+Tinytest.add("minimongo - lookup", function (test) {
+  var lookupA = MinimongoTest.makeLookupFunction('a');
+  test.equal(lookupA({}), [{value: undefined}]);
+  test.equal(lookupA({a: 1}), [{value: 1}]);
+  test.equal(lookupA({a: [1]}), [{value: [1]}]);
+
+  var lookupAX = MinimongoTest.makeLookupFunction('a.x');
+  test.equal(lookupAX({a: {x: 1}}), [{value: 1}]);
+  test.equal(lookupAX({a: {x: [1]}}), [{value: [1]}]);
+  test.equal(lookupAX({a: 5}), [{value: undefined}]);
+  test.equal(lookupAX({a: [{x: 1}, {x: [2]}, {y: 3}]}),
+             [{value: 1, arrayIndices: [0]},
+              {value: [2], arrayIndices: [1]},
+              {value: undefined, arrayIndices: [2]}]);
+
+  var lookupA0X = MinimongoTest.makeLookupFunction('a.0.x');
+  test.equal(lookupA0X({a: [{x: 1}]}), [
+    // From interpreting '0' as "0th array element".
+    {value: 1, arrayIndices: [0, 'x']},
+    // From interpreting '0' as "after branching in the array, look in the
+    // object {x:1} for a field named 0".
+    {value: undefined, arrayIndices: [0]}]);
+  test.equal(lookupA0X({a: [{x: [1]}]}), [
+    {value: [1], arrayIndices: [0, 'x']},
+    {value: undefined, arrayIndices: [0]}]);
+  test.equal(lookupA0X({a: 5}), [{value: undefined}]);
+  test.equal(lookupA0X({a: [{x: 1}, {x: [2]}, {y: 3}]}), [
+    // From interpreting '0' as "0th array element".
+    {value: 1, arrayIndices: [0, 'x']},
+    // From interpreting '0' as "after branching in the array, look in the
+    // object {x:1} for a field named 0".
+    {value: undefined, arrayIndices: [0]},
+    {value: undefined, arrayIndices: [1]},
+    {value: undefined, arrayIndices: [2]}
+  ]);
+
+  test.equal(
+    MinimongoTest.makeLookupFunction('w.x.0.z')({
+      w: [{x: [{z: 5}]}]}), [
+        // From interpreting '0' as "0th array element".
+        {value: 5, arrayIndices: [0, 0, 'x']},
+        // From interpreting '0' as "after branching in the array, look in the
+        // object {z:5} for a field named "0".
+        {value: undefined, arrayIndices: [0, 0]}
+      ]);
+});
+
+Tinytest.add("minimongo - selector_compiler", function (test) {
+  var matches = function (shouldMatch, selector, doc) {
+    var doesMatch = new Minimongo.Matcher(selector).documentMatches(doc).result;
+    if (doesMatch != shouldMatch) {
+      // XXX super janky
+      test.fail({message: "minimongo match failure: document " +
+                 (shouldMatch ? "should match, but doesn't" :
+                  "shouldn't match, but does"),
+                 selector: JSON.stringify(selector),
+                 document: JSON.stringify(doc)
+                });
+    }
+  };
+
+  var match = _.bind(matches, null, true);
+  var nomatch = _.bind(matches, null, false);
+
+  // XXX blog post about what I learned while writing these tests (weird
+  // mongo edge cases)
+
+  // empty selectors
+  match({}, {});
+  match({}, {a: 12});
+
+  // scalars
+  match(1, {_id: 1, a: 'foo'});
+  nomatch(1, {_id: 2, a: 'foo'});
+  match('a', {_id: 'a', a: 'foo'});
+  nomatch('a', {_id: 'b', a: 'foo'});
+
+  // safety
+  nomatch(undefined, {});
+  nomatch(undefined, {_id: 'foo'});
+  nomatch(false, {_id: 'foo'});
+  nomatch(null, {_id: 'foo'});
+  nomatch({_id: undefined}, {_id: 'foo'});
+  nomatch({_id: false}, {_id: 'foo'});
+  nomatch({_id: null}, {_id: 'foo'});
+
+  // matching one or more keys
+  nomatch({a: 12}, {});
+  match({a: 12}, {a: 12});
+  match({a: 12}, {a: 12, b: 13});
+  match({a: 12, b: 13}, {a: 12, b: 13});
+  match({a: 12, b: 13}, {a: 12, b: 13, c: 14});
+  nomatch({a: 12, b: 13, c: 14}, {a: 12, b: 13});
+  nomatch({a: 12, b: 13}, {b: 13, c: 14});
+
+  match({a: 12}, {a: [12]});
+  match({a: 12}, {a: [11, 12, 13]});
+  nomatch({a: 12}, {a: [11, 13]});
+  match({a: 12, b: 13}, {a: [11, 12, 13], b: [13, 14, 15]});
+  nomatch({a: 12, b: 13}, {a: [11, 12, 13], b: [14, 15]});
+
+  // dates
+  var date1 = new Date;
+  var date2 = new Date(date1.getTime() + 1000);
+  match({a: date1}, {a: date1});
+  nomatch({a: date1}, {a: date2});
+
+
+  // arrays
+  match({a: [1,2]}, {a: [1, 2]});
+  match({a: [1,2]}, {a: [[1, 2]]});
+  match({a: [1,2]}, {a: [[3, 4], [1, 2]]});
+  nomatch({a: [1,2]}, {a: [3, 4]});
+  nomatch({a: [1,2]}, {a: [[[1, 2]]]});
+
+  // literal documents
+  match({a: {b: 12}}, {a: {b: 12}});
+  nomatch({a: {b: 12, c: 13}}, {a: {b: 12}});
+  nomatch({a: {b: 12}}, {a: {b: 12, c: 13}});
+  match({a: {b: 12, c: 13}}, {a: {b: 12, c: 13}});
+  nomatch({a: {b: 12, c: 13}}, {a: {c: 13, b: 12}}); // tested on mongodb
+  nomatch({a: {}}, {a: {b: 12}});
+  nomatch({a: {b:12}}, {a: {}});
+  match(
+    {a: {b: 12, c: [13, true, false, 2.2, "a", null, {d: 14}]}},
+    {a: {b: 12, c: [13, true, false, 2.2, "a", null, {d: 14}]}});
+  match({a: {b: 12}}, {a: {b: 12}, k: 99});
+
+  match({a: {b: 12}}, {a: [{b: 12}]});
+  nomatch({a: {b: 12}}, {a: [[{b: 12}]]});
+  match({a: {b: 12}}, {a: [{b: 11}, {b: 12}, {b: 13}]});
+  nomatch({a: {b: 12}}, {a: [{b: 11}, {b: 12, c: 20}, {b: 13}]});
+  nomatch({a: {b: 12, c: 20}}, {a: [{b: 11}, {b: 12}, {c: 20}]});
+  match({a: {b: 12, c: 20}}, {a: [{b: 11}, {b: 12, c: 20}, {b: 13}]});
+
+  // null
+  match({a: null}, {a: null});
+  match({a: null}, {b: 12});
+  nomatch({a: null}, {a: 12});
+  match({a: null}, {a: [1, 2, null, 3]}); // tested on mongodb
+  nomatch({a: null}, {a: [1, 2, {}, 3]}); // tested on mongodb
+
+  // order comparisons: $lt, $gt, $lte, $gte
+  match({a: {$lt: 10}}, {a: 9});
+  nomatch({a: {$lt: 10}}, {a: 10});
+  nomatch({a: {$lt: 10}}, {a: 11});
+
+  match({a: {$gt: 10}}, {a: 11});
+  nomatch({a: {$gt: 10}}, {a: 10});
+  nomatch({a: {$gt: 10}}, {a: 9});
+
+  match({a: {$lte: 10}}, {a: 9});
+  match({a: {$lte: 10}}, {a: 10});
+  nomatch({a: {$lte: 10}}, {a: 11});
+
+  match({a: {$gte: 10}}, {a: 11});
+  match({a: {$gte: 10}}, {a: 10});
+  nomatch({a: {$gte: 10}}, {a: 9});
+
+  match({a: {$lt: 10}}, {a: [11, 9, 12]});
+  nomatch({a: {$lt: 10}}, {a: [11, 12]});
+
+  // (there's a full suite of ordering test elsewhere)
+  nomatch({a: {$lt: "null"}}, {a: null});
+  match({a: {$lt: {x: [2, 3, 4]}}}, {a: {x: [1, 3, 4]}});
+  match({a: {$gt: {x: [2, 3, 4]}}}, {a: {x: [3, 3, 4]}});
+  nomatch({a: {$gt: {x: [2, 3, 4]}}}, {a: {x: [1, 3, 4]}});
+  nomatch({a: {$gt: {x: [2, 3, 4]}}}, {a: {x: [2, 3, 4]}});
+  nomatch({a: {$lt: {x: [2, 3, 4]}}}, {a: {x: [2, 3, 4]}});
+  match({a: {$gte: {x: [2, 3, 4]}}}, {a: {x: [2, 3, 4]}});
+  match({a: {$lte: {x: [2, 3, 4]}}}, {a: {x: [2, 3, 4]}});
+
+  nomatch({a: {$gt: [2, 3]}}, {a: [1, 2]}); // tested against mongodb
+
+  // composition of two qualifiers
+  nomatch({a: {$lt: 11, $gt: 9}}, {a: 8});
+  nomatch({a: {$lt: 11, $gt: 9}}, {a: 9});
+  match({a: {$lt: 11, $gt: 9}}, {a: 10});
+  nomatch({a: {$lt: 11, $gt: 9}}, {a: 11});
+  nomatch({a: {$lt: 11, $gt: 9}}, {a: 12});
+
+  match({a: {$lt: 11, $gt: 9}}, {a: [8, 9, 10, 11, 12]});
+  match({a: {$lt: 11, $gt: 9}}, {a: [8, 9, 11, 12]}); // tested against mongodb
+
+  // $all
+  match({a: {$all: [1, 2]}}, {a: [1, 2]});
+  nomatch({a: {$all: [1, 2, 3]}}, {a: [1, 2]});
+  match({a: {$all: [1, 2]}}, {a: [3, 2, 1]});
+  match({a: {$all: [1, "x"]}}, {a: [3, "x", 1]});
+  nomatch({a: {$all: ['2']}}, {a: 2});
+  nomatch({a: {$all: [2]}}, {a: '2'});
+  match({a: {$all: [[1, 2], [1, 3]]}}, {a: [[1, 3], [1, 2], [1, 4]]});
+  nomatch({a: {$all: [[1, 2], [1, 3]]}}, {a: [[1, 4], [1, 2], [1, 4]]});
+  match({a: {$all: [2, 2]}}, {a: [2]}); // tested against mongodb
+  nomatch({a: {$all: [2, 3]}}, {a: [2, 2]});
+
+  nomatch({a: {$all: [1, 2]}}, {a: [[1, 2]]}); // tested against mongodb
+  nomatch({a: {$all: [1, 2]}}, {}); // tested against mongodb, field doesn't exist
+  nomatch({a: {$all: [1, 2]}}, {a: {foo: 'bar'}}); // tested against mongodb, field is not an object
+  nomatch({a: {$all: []}}, {a: []});
+  nomatch({a: {$all: []}}, {a: [5]});
+  match({a: {$all: [/i/, /e/i]}}, {a: ["foo", "bEr", "biz"]});
+  nomatch({a: {$all: [/i/, /e/i]}}, {a: ["foo", "bar", "biz"]});
+  match({a: {$all: [{b: 3}]}}, {a: [{b: 3}]});
+  // Members of $all other than regexps are *equality matches*, not document
+  // matches.
+  nomatch({a: {$all: [{b: 3}]}}, {a: [{b: 3, k: 4}]});
+  test.throws(function () {
+    match({a: {$all: [{$gt: 4}]}}, {});
+  });
+
+  // $exists
+  match({a: {$exists: true}}, {a: 12});
+  nomatch({a: {$exists: true}}, {b: 12});
+  nomatch({a: {$exists: false}}, {a: 12});
+  match({a: {$exists: false}}, {b: 12});
+
+  match({a: {$exists: true}}, {a: []});
+  nomatch({a: {$exists: true}}, {b: []});
+  nomatch({a: {$exists: false}}, {a: []});
+  match({a: {$exists: false}}, {b: []});
+
+  match({a: {$exists: true}}, {a: [1]});
+  nomatch({a: {$exists: true}}, {b: [1]});
+  nomatch({a: {$exists: false}}, {a: [1]});
+  match({a: {$exists: false}}, {b: [1]});
+
+  match({a: {$exists: 1}}, {a: 5});
+  match({a: {$exists: 0}}, {b: 5});
+
+  nomatch({'a.x':{$exists: false}}, {a: [{}, {x: 5}]});
+  match({'a.x':{$exists: true}}, {a: [{}, {x: 5}]});
+  match({'a.x':{$exists: true}}, {a: [{}, {x: 5}]});
+  match({'a.x':{$exists: true}}, {a: {x: []}});
+  match({'a.x':{$exists: true}}, {a: {x: null}});
+
+  // $mod
+  match({a: {$mod: [10, 1]}}, {a: 11});
+  nomatch({a: {$mod: [10, 1]}}, {a: 12});
+  match({a: {$mod: [10, 1]}}, {a: [10, 11, 12]});
+  nomatch({a: {$mod: [10, 1]}}, {a: [10, 12]});
+  _.each([
+    5,
+    [10],
+    [10, 1, 2],
+    "foo",
+    {bar: 1},
+    []
+  ], function (badMod) {
+    test.throws(function () {
+      match({a: {$mod: badMod}}, {a: 11});
+    });
+  });
+
+  // $ne
+  match({a: {$ne: 1}}, {a: 2});
+  nomatch({a: {$ne: 2}}, {a: 2});
+  match({a: {$ne: [1]}}, {a: [2]});
+
+  nomatch({a: {$ne: [1, 2]}}, {a: [1, 2]}); // all tested against mongodb
+  nomatch({a: {$ne: 1}}, {a: [1, 2]});
+  nomatch({a: {$ne: 2}}, {a: [1, 2]});
+  match({a: {$ne: 3}}, {a: [1, 2]});
+  nomatch({'a.b': {$ne: 1}}, {a: [{b: 1}, {b: 2}]});
+  nomatch({'a.b': {$ne: 2}}, {a: [{b: 1}, {b: 2}]});
+  match({'a.b': {$ne: 3}}, {a: [{b: 1}, {b: 2}]});
+
+  nomatch({a: {$ne: {x: 1}}}, {a: {x: 1}});
+  match({a: {$ne: {x: 1}}}, {a: {x: 2}});
+  match({a: {$ne: {x: 1}}}, {a: {x: 1, y: 2}});
+
+  // This query means: All 'a.b' must be non-5, and some 'a.b' must be >6.
+  match({'a.b': {$ne: 5, $gt: 6}}, {a: [{b: 2}, {b: 10}]});
+  nomatch({'a.b': {$ne: 5, $gt: 6}}, {a: [{b: 2}, {b: 4}]});
+  nomatch({'a.b': {$ne: 5, $gt: 6}}, {a: [{b: 2}, {b: 5}]});
+  nomatch({'a.b': {$ne: 5, $gt: 6}}, {a: [{b: 10}, {b: 5}]});
+  // Should work the same if the branch is at the bottom.
+  match({a: {$ne: 5, $gt: 6}}, {a: [2, 10]});
+  nomatch({a: {$ne: 5, $gt: 6}}, {a: [2, 4]});
+  nomatch({a: {$ne: 5, $gt: 6}}, {a: [2, 5]});
+  nomatch({a: {$ne: 5, $gt: 6}}, {a: [10, 5]});
+
+  // $in
+  match({a: {$in: [1, 2, 3]}}, {a: 2});
+  nomatch({a: {$in: [1, 2, 3]}}, {a: 4});
+  match({a: {$in: [[1], [2], [3]]}}, {a: [2]});
+  nomatch({a: {$in: [[1], [2], [3]]}}, {a: [4]});
+  match({a: {$in: [{b: 1}, {b: 2}, {b: 3}]}}, {a: {b: 2}});
+  nomatch({a: {$in: [{b: 1}, {b: 2}, {b: 3}]}}, {a: {b: 4}});
+
+  match({a: {$in: [1, 2, 3]}}, {a: [2]}); // tested against mongodb
+  match({a: {$in: [{x: 1}, {x: 2}, {x: 3}]}}, {a: [{x: 2}]});
+  match({a: {$in: [1, 2, 3]}}, {a: [4, 2]});
+  nomatch({a: {$in: [1, 2, 3]}}, {a: [4]});
+
+  match({a: {$in: ['x', /foo/i]}}, {a: 'x'});
+  match({a: {$in: ['x', /foo/i]}}, {a: 'fOo'});
+  match({a: {$in: ['x', /foo/i]}}, {a: ['f', 'fOo']});
+  nomatch({a: {$in: ['x', /foo/i]}}, {a: ['f', 'fOx']});
+
+  match({a: {$in: [1, null]}}, {});
+  match({'a.b': {$in: [1, null]}}, {});
+  match({'a.b': {$in: [1, null]}}, {a: {}});
+  match({'a.b': {$in: [1, null]}}, {a: {b: null}});
+  nomatch({'a.b': {$in: [1, null]}}, {a: {b: 5}});
+  nomatch({'a.b': {$in: [1]}}, {a: {b: null}});
+  nomatch({'a.b': {$in: [1]}}, {a: {}});
+  nomatch({'a.b': {$in: [1, null]}}, {a: [{b: 5}]});
+  match({'a.b': {$in: [1, null]}}, {a: [{b: 5}, {}]});
+  nomatch({'a.b': {$in: [1, null]}}, {a: [{b: 5}, []]});
+  nomatch({'a.b': {$in: [1, null]}}, {a: [{b: 5}, 5]});
+
+  // $nin
+  nomatch({a: {$nin: [1, 2, 3]}}, {a: 2});
+  match({a: {$nin: [1, 2, 3]}}, {a: 4});
+  nomatch({a: {$nin: [[1], [2], [3]]}}, {a: [2]});
+  match({a: {$nin: [[1], [2], [3]]}}, {a: [4]});
+  nomatch({a: {$nin: [{b: 1}, {b: 2}, {b: 3}]}}, {a: {b: 2}});
+  match({a: {$nin: [{b: 1}, {b: 2}, {b: 3}]}}, {a: {b: 4}});
+
+  nomatch({a: {$nin: [1, 2, 3]}}, {a: [2]}); // tested against mongodb
+  nomatch({a: {$nin: [{x: 1}, {x: 2}, {x: 3}]}}, {a: [{x: 2}]});
+  nomatch({a: {$nin: [1, 2, 3]}}, {a: [4, 2]});
+  nomatch({'a.b': {$nin: [1, 2, 3]}}, {a: [{b:4}, {b:2}]});
+  match({a: {$nin: [1, 2, 3]}}, {a: [4]});
+  match({'a.b': {$nin: [1, 2, 3]}}, {a: [{b:4}]});
+
+  nomatch({a: {$nin: ['x', /foo/i]}}, {a: 'x'});
+  nomatch({a: {$nin: ['x', /foo/i]}}, {a: 'fOo'});
+  nomatch({a: {$nin: ['x', /foo/i]}}, {a: ['f', 'fOo']});
+  match({a: {$nin: ['x', /foo/i]}}, {a: ['f', 'fOx']});
+
+  nomatch({a: {$nin: [1, null]}}, {});
+  nomatch({'a.b': {$nin: [1, null]}}, {});
+  nomatch({'a.b': {$nin: [1, null]}}, {a: {}});
+  nomatch({'a.b': {$nin: [1, null]}}, {a: {b: null}});
+  match({'a.b': {$nin: [1, null]}}, {a: {b: 5}});
+  match({'a.b': {$nin: [1]}}, {a: {b: null}});
+  match({'a.b': {$nin: [1]}}, {a: {}});
+  match({'a.b': {$nin: [1, null]}}, {a: [{b: 5}]});
+  nomatch({'a.b': {$nin: [1, null]}}, {a: [{b: 5}, {}]});
+  match({'a.b': {$nin: [1, null]}}, {a: [{b: 5}, []]});
+  match({'a.b': {$nin: [1, null]}}, {a: [{b: 5}, 5]});
+
+  // $size
+  match({a: {$size: 0}}, {a: []});
+  match({a: {$size: 1}}, {a: [2]});
+  match({a: {$size: 2}}, {a: [2, 2]});
+  nomatch({a: {$size: 0}}, {a: [2]});
+  nomatch({a: {$size: 1}}, {a: []});
+  nomatch({a: {$size: 1}}, {a: [2, 2]});
+  nomatch({a: {$size: 0}}, {a: "2"});
+  nomatch({a: {$size: 1}}, {a: "2"});
+  nomatch({a: {$size: 2}}, {a: "2"});
+
+  nomatch({a: {$size: 2}}, {a: [[2,2]]}); // tested against mongodb
+
+  // $type
+  match({a: {$type: 1}}, {a: 1.1});
+  match({a: {$type: 1}}, {a: 1});
+  nomatch({a: {$type: 1}}, {a: "1"});
+  match({a: {$type: 2}}, {a: "1"});
+  nomatch({a: {$type: 2}}, {a: 1});
+  match({a: {$type: 3}}, {a: {}});
+  match({a: {$type: 3}}, {a: {b: 2}});
+  nomatch({a: {$type: 3}}, {a: []});
+  nomatch({a: {$type: 3}}, {a: [1]});
+  nomatch({a: {$type: 3}}, {a: null});
+  match({a: {$type: 5}}, {a: EJSON.newBinary(0)});
+  match({a: {$type: 5}}, {a: EJSON.newBinary(4)});
+  nomatch({a: {$type: 5}}, {a: []});
+  nomatch({a: {$type: 5}}, {a: [42]});
+  match({a: {$type: 7}}, {a: new MongoID.ObjectID()});
+  nomatch({a: {$type: 7}}, {a: "1234567890abcd1234567890"});
+  match({a: {$type: 8}}, {a: true});
+  match({a: {$type: 8}}, {a: false});
+  nomatch({a: {$type: 8}}, {a: "true"});
+  nomatch({a: {$type: 8}}, {a: 0});
+  nomatch({a: {$type: 8}}, {a: null});
+  nomatch({a: {$type: 8}}, {a: ''});
+  nomatch({a: {$type: 8}}, {});
+  match({a: {$type: 9}}, {a: (new Date)});
+  nomatch({a: {$type: 9}}, {a: +(new Date)});
+  match({a: {$type: 10}}, {a: null});
+  nomatch({a: {$type: 10}}, {a: false});
+  nomatch({a: {$type: 10}}, {a: ''});
+  nomatch({a: {$type: 10}}, {a: 0});
+  nomatch({a: {$type: 10}}, {});
+  match({a: {$type: 11}}, {a: /x/});
+  nomatch({a: {$type: 11}}, {a: 'x'});
+  nomatch({a: {$type: 11}}, {});
+
+  // The normal rule for {$type:4} (4 means array) is that it NOT good enough to
+  // just have an array that's the leaf that matches the path.  (An array inside
+  // that array is good, though.)
+  nomatch({a: {$type: 4}}, {a: []});
+  nomatch({a: {$type: 4}}, {a: [1]}); // tested against mongodb
+  match({a: {$type: 1}}, {a: [1]});
+  nomatch({a: {$type: 2}}, {a: [1]});
+  match({a: {$type: 1}}, {a: ["1", 1]});
+  match({a: {$type: 2}}, {a: ["1", 1]});
+  nomatch({a: {$type: 3}}, {a: ["1", 1]});
+  nomatch({a: {$type: 4}}, {a: ["1", 1]});
+  nomatch({a: {$type: 1}}, {a: ["1", []]});
+  match({a: {$type: 2}}, {a: ["1", []]});
+  match({a: {$type: 4}}, {a: ["1", []]}); // tested against mongodb
+  // An exception to the normal rule is that an array found via numeric index is
+  // examined itself, and its elements are not.
+  match({'a.0': {$type: 4}}, {a: [[0]]});
+  nomatch({'a.0': {$type: 1}}, {a: [[0]]});
+
+  // regular expressions
+  match({a: /a/}, {a: 'cat'});
+  nomatch({a: /a/}, {a: 'cut'});
+  nomatch({a: /a/}, {a: 'CAT'});
+  match({a: /a/i}, {a: 'CAT'});
+  match({a: /a/}, {a: ['foo', 'bar']});  // search within array...
+  nomatch({a: /,/}, {a: ['foo', 'bar']});  // but not by stringifying
+  match({a: {$regex: 'a'}}, {a: ['foo', 'bar']});
+  nomatch({a: {$regex: ','}}, {a: ['foo', 'bar']});
+  match({a: {$regex: /a/}}, {a: 'cat'});
+  nomatch({a: {$regex: /a/}}, {a: 'cut'});
+  nomatch({a: {$regex: /a/}}, {a: 'CAT'});
+  match({a: {$regex: /a/i}}, {a: 'CAT'});
+  match({a: {$regex: /a/, $options: 'i'}}, {a: 'CAT'}); // tested
+  match({a: {$regex: /a/i, $options: 'i'}}, {a: 'CAT'}); // tested
+  nomatch({a: {$regex: /a/i, $options: ''}}, {a: 'CAT'}); // tested
+  match({a: {$regex: 'a'}}, {a: 'cat'});
+  nomatch({a: {$regex: 'a'}}, {a: 'cut'});
+  nomatch({a: {$regex: 'a'}}, {a: 'CAT'});
+  match({a: {$regex: 'a', $options: 'i'}}, {a: 'CAT'});
+  match({a: {$regex: '', $options: 'i'}}, {a: 'foo'});
+  nomatch({a: {$regex: '', $options: 'i'}}, {});
+  nomatch({a: {$regex: '', $options: 'i'}}, {a: 5});
+  nomatch({a: /undefined/}, {});
+  nomatch({a: {$regex: 'undefined'}}, {});
+  nomatch({a: /xxx/}, {});
+  nomatch({a: {$regex: 'xxx'}}, {});
+
+  // GitHub issue #2817:
+  // Regexps with a global flag ('g') keep a state when tested against the same
+  // string. Selector shouldn't return different result for similar documents
+  // because of this state.
+  var reusedRegexp = /sh/ig;
+  match({a: reusedRegexp}, {a: 'Shorts'});
+  match({a: reusedRegexp}, {a: 'Shorts'});
+  match({a: reusedRegexp}, {a: 'Shorts'});
+
+  match({a: {$regex: reusedRegexp}}, {a: 'Shorts'});
+  match({a: {$regex: reusedRegexp}}, {a: 'Shorts'});
+  match({a: {$regex: reusedRegexp}}, {a: 'Shorts'});
+
+  test.throws(function () {
+    match({a: {$options: 'i'}}, {a: 12});
+  });
+
+  match({a: /a/}, {a: ['dog', 'cat']});
+  nomatch({a: /a/}, {a: ['dog', 'puppy']});
+
+  // we don't support regexps in minimongo very well (eg, there's no EJSON
+  // encoding so it won't go over the wire), but run these tests anyway
+  match({a: /a/}, {a: /a/});
+  match({a: /a/}, {a: ['x', /a/]});
+  nomatch({a: /a/}, {a: /a/i});
+  nomatch({a: /a/m}, {a: /a/});
+  nomatch({a: /a/}, {a: /b/});
+  nomatch({a: /5/}, {a: 5});
+  nomatch({a: /t/}, {a: true});
+  match({a: /m/i}, {a: ['x', 'xM']});
+
+  test.throws(function () {
+    match({a: {$regex: /a/, $options: 'x'}}, {a: 'cat'});
+  });
+  test.throws(function () {
+    match({a: {$regex: /a/, $options: 's'}}, {a: 'cat'});
+  });
+
+  // $not
+  match({x: {$not: {$gt: 7}}}, {x: 6});
+  nomatch({x: {$not: {$gt: 7}}}, {x: 8});
+  match({x: {$not: {$lt: 10, $gt: 7}}}, {x: 11});
+  nomatch({x: {$not: {$lt: 10, $gt: 7}}}, {x: 9});
+  match({x: {$not: {$lt: 10, $gt: 7}}}, {x: 6});
+
+  match({x: {$not: {$gt: 7}}}, {x: [2, 3, 4]});
+  match({'x.y': {$not: {$gt: 7}}}, {x: [{y:2}, {y:3}, {y:4}]});
+  nomatch({x: {$not: {$gt: 7}}}, {x: [2, 3, 4, 10]});
+  nomatch({'x.y': {$not: {$gt: 7}}}, {x: [{y:2}, {y:3}, {y:4}, {y:10}]});
+
+  match({x: {$not: /a/}}, {x: "dog"});
+  nomatch({x: {$not: /a/}}, {x: "cat"});
+  match({x: {$not: /a/}}, {x: ["dog", "puppy"]});
+  nomatch({x: {$not: /a/}}, {x: ["kitten", "cat"]});
+
+  // dotted keypaths: bare values
+  match({"a.b": 1}, {a: {b: 1}});
+  nomatch({"a.b": 1}, {a: {b: 2}});
+  match({"a.b": [1,2,3]}, {a: {b: [1,2,3]}});
+  nomatch({"a.b": [1,2,3]}, {a: {b: [4]}});
+  match({"a.b": /a/}, {a: {b: "cat"}});
+  nomatch({"a.b": /a/}, {a: {b: "dog"}});
+  match({"a.b.c": null}, {});
+  match({"a.b.c": null}, {a: 1});
+  match({"a.b": null}, {a: 1});
+  match({"a.b.c": null}, {a: {b: 4}});
+
+  // dotted keypaths, nulls, numeric indices, arrays
+  nomatch({"a.b": null}, {a: [1]});
+  match({"a.b": []}, {a: {b: []}});
+  var big = {a: [{b: 1}, 2, {}, {b: [3, 4]}]};
+  match({"a.b": 1}, big);
+  match({"a.b": [3, 4]}, big);
+  match({"a.b": 3}, big);
+  match({"a.b": 4}, big);
+  match({"a.b": null}, big);  // matches on slot 2
+  match({'a.1': 8}, {a: [7, 8, 9]});
+  nomatch({'a.1': 7}, {a: [7, 8, 9]});
+  nomatch({'a.1': null}, {a: [7, 8, 9]});
+  match({'a.1': [8, 9]}, {a: [7, [8, 9]]});
+  nomatch({'a.1': 6}, {a: [[6, 7], [8, 9]]});
+  nomatch({'a.1': 7}, {a: [[6, 7], [8, 9]]});
+  nomatch({'a.1': 8}, {a: [[6, 7], [8, 9]]});
+  nomatch({'a.1': 9}, {a: [[6, 7], [8, 9]]});
+  match({"a.1": 2}, {a: [0, {1: 2}, 3]});
+  match({"a.1": {1: 2}}, {a: [0, {1: 2}, 3]});
+  match({"x.1.y": 8}, {x: [7, {y: 8}, 9]});
+  // comes from trying '1' as key in the plain object
+  match({"x.1.y": null}, {x: [7, {y: 8}, 9]});
+  match({"a.1.b": 9}, {a: [7, {b: 9}, {1: {b: 'foo'}}]});
+  match({"a.1.b": 'foo'}, {a: [7, {b: 9}, {1: {b: 'foo'}}]});
+  match({"a.1.b": null}, {a: [7, {b: 9}, {1: {b: 'foo'}}]});
+  match({"a.1.b": 2}, {a: [1, [{b: 2}], 3]});
+  nomatch({"a.1.b": null}, {a: [1, [{b: 2}], 3]});
+  // this is new behavior in mongo 2.5
+  nomatch({"a.0.b": null}, {a: [5]});
+  match({"a.1": 4}, {a: [{1: 4}, 5]});
+  match({"a.1": 5}, {a: [{1: 4}, 5]});
+  nomatch({"a.1": null}, {a: [{1: 4}, 5]});
+  match({"a.1.foo": 4}, {a: [{1: {foo: 4}}, {foo: 5}]});
+  match({"a.1.foo": 5}, {a: [{1: {foo: 4}}, {foo: 5}]});
+  match({"a.1.foo": null}, {a: [{1: {foo: 4}}, {foo: 5}]});
+
+  // trying to access a dotted field that is undefined at some point
+  // down the chain
+  nomatch({"a.b": 1}, {x: 2});
+  nomatch({"a.b.c": 1}, {a: {x: 2}});
+  nomatch({"a.b.c": 1}, {a: {b: {x: 2}}});
+  nomatch({"a.b.c": 1}, {a: {b: 1}});
+  nomatch({"a.b.c": 1}, {a: {b: 0}});
+
+  // dotted keypaths: literal objects
+  match({"a.b": {c: 1}}, {a: {b: {c: 1}}});
+  nomatch({"a.b": {c: 1}}, {a: {b: {c: 2}}});
+  nomatch({"a.b": {c: 1}}, {a: {b: 2}});
+  match({"a.b": {c: 1, d: 2}}, {a: {b: {c: 1, d: 2}}});
+  nomatch({"a.b": {c: 1, d: 2}}, {a: {b: {c: 1, d: 1}}});
+  nomatch({"a.b": {c: 1, d: 2}}, {a: {b: {d: 2}}});
+
+  // dotted keypaths: $ operators
+  match({"a.b": {$in: [1, 2, 3]}}, {a: {b: [2]}}); // tested against mongodb
+  match({"a.b": {$in: [{x: 1}, {x: 2}, {x: 3}]}}, {a: {b: [{x: 2}]}});
+  match({"a.b": {$in: [1, 2, 3]}}, {a: {b: [4, 2]}});
+  nomatch({"a.b": {$in: [1, 2, 3]}}, {a: {b: [4]}});
+
+  // $or
+  test.throws(function () {
+    match({$or: []}, {});
+  });
+  test.throws(function () {
+    match({$or: [5]}, {});
+  });
+  test.throws(function () {
+    match({$or: []}, {a: 1});
+  });
+  match({$or: [{a: 1}]}, {a: 1});
+  nomatch({$or: [{b: 2}]}, {a: 1});
+  match({$or: [{a: 1}, {b: 2}]}, {a: 1});
+  nomatch({$or: [{c: 3}, {d: 4}]}, {a: 1});
+  match({$or: [{a: 1}, {b: 2}]}, {a: [1, 2, 3]});
+  nomatch({$or: [{a: 1}, {b: 2}]}, {c: [1, 2, 3]});
+  nomatch({$or: [{a: 1}, {b: 2}]}, {a: [2, 3, 4]});
+  match({$or: [{a: 1}, {a: 2}]}, {a: 1});
+  match({$or: [{a: 1}, {a: 2}], b: 2}, {a: 1, b: 2});
+  nomatch({$or: [{a: 2}, {a: 3}], b: 2}, {a: 1, b: 2});
+  nomatch({$or: [{a: 1}, {a: 2}], b: 3}, {a: 1, b: 2});
+
+  // Combining $or with equality
+  match({x: 1, $or: [{a: 1}, {b: 1}]}, {x: 1, b: 1});
+  match({$or: [{a: 1}, {b: 1}], x: 1}, {x: 1, b: 1});
+  nomatch({x: 1, $or: [{a: 1}, {b: 1}]}, {b: 1});
+  nomatch({x: 1, $or: [{a: 1}, {b: 1}]}, {x: 1});
+
+  // $or and $lt, $lte, $gt, $gte
+  match({$or: [{a: {$lte: 1}}, {a: 2}]}, {a: 1});
+  nomatch({$or: [{a: {$lt: 1}}, {a: 2}]}, {a: 1});
+  match({$or: [{a: {$gte: 1}}, {a: 2}]}, {a: 1});
+  nomatch({$or: [{a: {$gt: 1}}, {a: 2}]}, {a: 1});
+  match({$or: [{b: {$gt: 1}}, {b: {$lt: 3}}]}, {b: 2});
+  nomatch({$or: [{b: {$lt: 1}}, {b: {$gt: 3}}]}, {b: 2});
+
+  // $or and $in
+  match({$or: [{a: {$in: [1, 2, 3]}}]}, {a: 1});
+  nomatch({$or: [{a: {$in: [4, 5, 6]}}]}, {a: 1});
+  match({$or: [{a: {$in: [1, 2, 3]}}, {b: 2}]}, {a: 1});
+  match({$or: [{a: {$in: [1, 2, 3]}}, {b: 2}]}, {b: 2});
+  nomatch({$or: [{a: {$in: [1, 2, 3]}}, {b: 2}]}, {c: 3});
+  match({$or: [{a: {$in: [1, 2, 3]}}, {b: {$in: [1, 2, 3]}}]}, {b: 2});
+  nomatch({$or: [{a: {$in: [1, 2, 3]}}, {b: {$in: [4, 5, 6]}}]}, {b: 2});
+
+  // $or and $nin
+  nomatch({$or: [{a: {$nin: [1, 2, 3]}}]}, {a: 1});
+  match({$or: [{a: {$nin: [4, 5, 6]}}]}, {a: 1});
+  nomatch({$or: [{a: {$nin: [1, 2, 3]}}, {b: 2}]}, {a: 1});
+  match({$or: [{a: {$nin: [1, 2, 3]}}, {b: 2}]}, {b: 2});
+  match({$or: [{a: {$nin: [1, 2, 3]}}, {b: 2}]}, {c: 3});
+  match({$or: [{a: {$nin: [1, 2, 3]}}, {b: {$nin: [1, 2, 3]}}]}, {b: 2});
+  nomatch({$or: [{a: {$nin: [1, 2, 3]}}, {b: {$nin: [1, 2, 3]}}]}, {a: 1, b: 2});
+  match({$or: [{a: {$nin: [1, 2, 3]}}, {b: {$nin: [4, 5, 6]}}]}, {b: 2});
+
+  // $or and dot-notation
+  match({$or: [{"a.b": 1}, {"a.b": 2}]}, {a: {b: 1}});
+  match({$or: [{"a.b": 1}, {"a.c": 1}]}, {a: {b: 1}});
+  nomatch({$or: [{"a.b": 2}, {"a.c": 1}]}, {a: {b: 1}});
+
+  // $or and nested objects
+  match({$or: [{a: {b: 1, c: 2}}, {a: {b: 2, c: 1}}]}, {a: {b: 1, c: 2}});
+  nomatch({$or: [{a: {b: 1, c: 3}}, {a: {b: 2, c: 1}}]}, {a: {b: 1, c: 2}});
+
+  // $or and regexes
+  match({$or: [{a: /a/}]}, {a: "cat"});
+  nomatch({$or: [{a: /o/}]}, {a: "cat"});
+  match({$or: [{a: /a/}, {a: /o/}]}, {a: "cat"});
+  nomatch({$or: [{a: /i/}, {a: /o/}]}, {a: "cat"});
+  match({$or: [{a: /i/}, {b: /o/}]}, {a: "cat", b: "dog"});
+
+  // $or and $ne
+  match({$or: [{a: {$ne: 1}}]}, {});
+  nomatch({$or: [{a: {$ne: 1}}]}, {a: 1});
+  match({$or: [{a: {$ne: 1}}]}, {a: 2});
+  match({$or: [{a: {$ne: 1}}]}, {b: 1});
+  match({$or: [{a: {$ne: 1}}, {a: {$ne: 2}}]}, {a: 1});
+  match({$or: [{a: {$ne: 1}}, {b: {$ne: 1}}]}, {a: 1});
+  nomatch({$or: [{a: {$ne: 1}}, {b: {$ne: 2}}]}, {a: 1, b: 2});
+
+  // $or and $not
+  match({$or: [{a: {$not: {$mod: [10, 1]}}}]}, {});
+  nomatch({$or: [{a: {$not: {$mod: [10, 1]}}}]}, {a: 1});
+  match({$or: [{a: {$not: {$mod: [10, 1]}}}]}, {a: 2});
+  match({$or: [{a: {$not: {$mod: [10, 1]}}}, {a: {$not: {$mod: [10, 2]}}}]}, {a: 1});
+  nomatch({$or: [{a: {$not: {$mod: [10, 1]}}}, {a: {$mod: [10, 2]}}]}, {a: 1});
+  match({$or: [{a: {$not: {$mod: [10, 1]}}}, {a: {$mod: [10, 2]}}]}, {a: 2});
+  match({$or: [{a: {$not: {$mod: [10, 1]}}}, {a: {$mod: [10, 2]}}]}, {a: 3});
+  // this is possibly an open-ended task, so we stop here ...
+
+  // $nor
+  test.throws(function () {
+    match({$nor: []}, {});
+  });
+  test.throws(function () {
+    match({$nor: [5]}, {});
+  });
+  test.throws(function () {
+    match({$nor: []}, {a: 1});
+  });
+  nomatch({$nor: [{a: 1}]}, {a: 1});
+  match({$nor: [{b: 2}]}, {a: 1});
+  nomatch({$nor: [{a: 1}, {b: 2}]}, {a: 1});
+  match({$nor: [{c: 3}, {d: 4}]}, {a: 1});
+  nomatch({$nor: [{a: 1}, {b: 2}]}, {a: [1, 2, 3]});
+  match({$nor: [{a: 1}, {b: 2}]}, {c: [1, 2, 3]});
+  match({$nor: [{a: 1}, {b: 2}]}, {a: [2, 3, 4]});
+  nomatch({$nor: [{a: 1}, {a: 2}]}, {a: 1});
+
+  // $nor and $lt, $lte, $gt, $gte
+  nomatch({$nor: [{a: {$lte: 1}}, {a: 2}]}, {a: 1});
+  match({$nor: [{a: {$lt: 1}}, {a: 2}]}, {a: 1});
+  nomatch({$nor: [{a: {$gte: 1}}, {a: 2}]}, {a: 1});
+  match({$nor: [{a: {$gt: 1}}, {a: 2}]}, {a: 1});
+  nomatch({$nor: [{b: {$gt: 1}}, {b: {$lt: 3}}]}, {b: 2});
+  match({$nor: [{b: {$lt: 1}}, {b: {$gt: 3}}]}, {b: 2});
+
+  // $nor and $in
+  nomatch({$nor: [{a: {$in: [1, 2, 3]}}]}, {a: 1});
+  match({$nor: [{a: {$in: [4, 5, 6]}}]}, {a: 1});
+  nomatch({$nor: [{a: {$in: [1, 2, 3]}}, {b: 2}]}, {a: 1});
+  nomatch({$nor: [{a: {$in: [1, 2, 3]}}, {b: 2}]}, {b: 2});
+  match({$nor: [{a: {$in: [1, 2, 3]}}, {b: 2}]}, {c: 3});
+  nomatch({$nor: [{a: {$in: [1, 2, 3]}}, {b: {$in: [1, 2, 3]}}]}, {b: 2});
+  match({$nor: [{a: {$in: [1, 2, 3]}}, {b: {$in: [4, 5, 6]}}]}, {b: 2});
+
+  // $nor and $nin
+  match({$nor: [{a: {$nin: [1, 2, 3]}}]}, {a: 1});
+  nomatch({$nor: [{a: {$nin: [4, 5, 6]}}]}, {a: 1});
+  match({$nor: [{a: {$nin: [1, 2, 3]}}, {b: 2}]}, {a: 1});
+  nomatch({$nor: [{a: {$nin: [1, 2, 3]}}, {b: 2}]}, {b: 2});
+  nomatch({$nor: [{a: {$nin: [1, 2, 3]}}, {b: 2}]}, {c: 3});
+  nomatch({$nor: [{a: {$nin: [1, 2, 3]}}, {b: {$nin: [1, 2, 3]}}]}, {b: 2});
+  match({$nor: [{a: {$nin: [1, 2, 3]}}, {b: {$nin: [1, 2, 3]}}]}, {a: 1, b: 2});
+  nomatch({$nor: [{a: {$nin: [1, 2, 3]}}, {b: {$nin: [4, 5, 6]}}]}, {b: 2});
+
+  // $nor and dot-notation
+  nomatch({$nor: [{"a.b": 1}, {"a.b": 2}]}, {a: {b: 1}});
+  nomatch({$nor: [{"a.b": 1}, {"a.c": 1}]}, {a: {b: 1}});
+  match({$nor: [{"a.b": 2}, {"a.c": 1}]}, {a: {b: 1}});
+
+  // $nor and nested objects
+  nomatch({$nor: [{a: {b: 1, c: 2}}, {a: {b: 2, c: 1}}]}, {a: {b: 1, c: 2}});
+  match({$nor: [{a: {b: 1, c: 3}}, {a: {b: 2, c: 1}}]}, {a: {b: 1, c: 2}});
+
+  // $nor and regexes
+  nomatch({$nor: [{a: /a/}]}, {a: "cat"});
+  match({$nor: [{a: /o/}]}, {a: "cat"});
+  nomatch({$nor: [{a: /a/}, {a: /o/}]}, {a: "cat"});
+  match({$nor: [{a: /i/}, {a: /o/}]}, {a: "cat"});
+  nomatch({$nor: [{a: /i/}, {b: /o/}]}, {a: "cat", b: "dog"});
+
+  // $nor and $ne
+  nomatch({$nor: [{a: {$ne: 1}}]}, {});
+  match({$nor: [{a: {$ne: 1}}]}, {a: 1});
+  nomatch({$nor: [{a: {$ne: 1}}]}, {a: 2});
+  nomatch({$nor: [{a: {$ne: 1}}]}, {b: 1});
+  nomatch({$nor: [{a: {$ne: 1}}, {a: {$ne: 2}}]}, {a: 1});
+  nomatch({$nor: [{a: {$ne: 1}}, {b: {$ne: 1}}]}, {a: 1});
+  match({$nor: [{a: {$ne: 1}}, {b: {$ne: 2}}]}, {a: 1, b: 2});
+
+  // $nor and $not
+  nomatch({$nor: [{a: {$not: {$mod: [10, 1]}}}]}, {});
+  match({$nor: [{a: {$not: {$mod: [10, 1]}}}]}, {a: 1});
+  nomatch({$nor: [{a: {$not: {$mod: [10, 1]}}}]}, {a: 2});
+  nomatch({$nor: [{a: {$not: {$mod: [10, 1]}}}, {a: {$not: {$mod: [10, 2]}}}]}, {a: 1});
+  match({$nor: [{a: {$not: {$mod: [10, 1]}}}, {a: {$mod: [10, 2]}}]}, {a: 1});
+  nomatch({$nor: [{a: {$not: {$mod: [10, 1]}}}, {a: {$mod: [10, 2]}}]}, {a: 2});
+  nomatch({$nor: [{a: {$not: {$mod: [10, 1]}}}, {a: {$mod: [10, 2]}}]}, {a: 3});
+
+  // $and
+
+  test.throws(function () {
+    match({$and: []}, {});
+  });
+  test.throws(function () {
+    match({$and: [5]}, {});
+  });
+  test.throws(function () {
+    match({$and: []}, {a: 1});
+  });
+  match({$and: [{a: 1}]}, {a: 1});
+  nomatch({$and: [{a: 1}, {a: 2}]}, {a: 1});
+  nomatch({$and: [{a: 1}, {b: 1}]}, {a: 1});
+  match({$and: [{a: 1}, {b: 2}]}, {a: 1, b: 2});
+  nomatch({$and: [{a: 1}, {b: 1}]}, {a: 1, b: 2});
+  match({$and: [{a: 1}, {b: 2}], c: 3}, {a: 1, b: 2, c: 3});
+  nomatch({$and: [{a: 1}, {b: 2}], c: 4}, {a: 1, b: 2, c: 3});
+
+  // $and and regexes
+  match({$and: [{a: /a/}]}, {a: "cat"});
+  match({$and: [{a: /a/i}]}, {a: "CAT"});
+  nomatch({$and: [{a: /o/}]}, {a: "cat"});
+  nomatch({$and: [{a: /a/}, {a: /o/}]}, {a: "cat"});
+  match({$and: [{a: /a/}, {b: /o/}]}, {a: "cat", b: "dog"});
+  nomatch({$and: [{a: /a/}, {b: /a/}]}, {a: "cat", b: "dog"});
+
+  // $and, dot-notation, and nested objects
+  match({$and: [{"a.b": 1}]}, {a: {b: 1}});
+  match({$and: [{a: {b: 1}}]}, {a: {b: 1}});
+  nomatch({$and: [{"a.b": 2}]}, {a: {b: 1}});
+  nomatch({$and: [{"a.c": 1}]}, {a: {b: 1}});
+  nomatch({$and: [{"a.b": 1}, {"a.b": 2}]}, {a: {b: 1}});
+  nomatch({$and: [{"a.b": 1}, {a: {b: 2}}]}, {a: {b: 1}});
+  match({$and: [{"a.b": 1}, {"c.d": 2}]}, {a: {b: 1}, c: {d: 2}});
+  nomatch({$and: [{"a.b": 1}, {"c.d": 1}]}, {a: {b: 1}, c: {d: 2}});
+  match({$and: [{"a.b": 1}, {c: {d: 2}}]}, {a: {b: 1}, c: {d: 2}});
+  nomatch({$and: [{"a.b": 1}, {c: {d: 1}}]}, {a: {b: 1}, c: {d: 2}});
+  nomatch({$and: [{"a.b": 2}, {c: {d: 2}}]}, {a: {b: 1}, c: {d: 2}});
+  match({$and: [{a: {b: 1}}, {c: {d: 2}}]}, {a: {b: 1}, c: {d: 2}});
+  nomatch({$and: [{a: {b: 2}}, {c: {d: 2}}]}, {a: {b: 1}, c: {d: 2}});
+
+  // $and and $in
+  nomatch({$and: [{a: {$in: []}}]}, {});
+  match({$and: [{a: {$in: [1, 2, 3]}}]}, {a: 1});
+  nomatch({$and: [{a: {$in: [4, 5, 6]}}]}, {a: 1});
+  nomatch({$and: [{a: {$in: [1, 2, 3]}}, {a: {$in: [4, 5, 6]}}]}, {a: 1});
+  nomatch({$and: [{a: {$in: [1, 2, 3]}}, {b: {$in: [1, 2, 3]}}]}, {a: 1, b: 4});
+  match({$and: [{a: {$in: [1, 2, 3]}}, {b: {$in: [4, 5, 6]}}]}, {a: 1, b: 4});
+
+
+  // $and and $nin
+  match({$and: [{a: {$nin: []}}]}, {});
+  nomatch({$and: [{a: {$nin: [1, 2, 3]}}]}, {a: 1});
+  match({$and: [{a: {$nin: [4, 5, 6]}}]}, {a: 1});
+  nomatch({$and: [{a: {$nin: [1, 2, 3]}}, {a: {$nin: [4, 5, 6]}}]}, {a: 1});
+  nomatch({$and: [{a: {$nin: [1, 2, 3]}}, {b: {$nin: [1, 2, 3]}}]}, {a: 1, b: 4});
+  nomatch({$and: [{a: {$nin: [1, 2, 3]}}, {b: {$nin: [4, 5, 6]}}]}, {a: 1, b: 4});
+
+  // $and and $lt, $lte, $gt, $gte
+  match({$and: [{a: {$lt: 2}}]}, {a: 1});
+  nomatch({$and: [{a: {$lt: 1}}]}, {a: 1});
+  match({$and: [{a: {$lte: 1}}]}, {a: 1});
+  match({$and: [{a: {$gt: 0}}]}, {a: 1});
+  nomatch({$and: [{a: {$gt: 1}}]}, {a: 1});
+  match({$and: [{a: {$gte: 1}}]}, {a: 1});
+  match({$and: [{a: {$gt: 0}}, {a: {$lt: 2}}]}, {a: 1});
+  nomatch({$and: [{a: {$gt: 1}}, {a: {$lt: 2}}]}, {a: 1});
+  nomatch({$and: [{a: {$gt: 0}}, {a: {$lt: 1}}]}, {a: 1});
+  match({$and: [{a: {$gte: 1}}, {a: {$lte: 1}}]}, {a: 1});
+  nomatch({$and: [{a: {$gte: 2}}, {a: {$lte: 0}}]}, {a: 1});
+
+  // $and and $ne
+  match({$and: [{a: {$ne: 1}}]}, {});
+  nomatch({$and: [{a: {$ne: 1}}]}, {a: 1});
+  match({$and: [{a: {$ne: 1}}]}, {a: 2});
+  nomatch({$and: [{a: {$ne: 1}}, {a: {$ne: 2}}]}, {a: 2});
+  match({$and: [{a: {$ne: 1}}, {a: {$ne: 3}}]}, {a: 2});
+
+  // $and and $not
+  match({$and: [{a: {$not: {$gt: 2}}}]}, {a: 1});
+  nomatch({$and: [{a: {$not: {$lt: 2}}}]}, {a: 1});
+  match({$and: [{a: {$not: {$lt: 0}}}, {a: {$not: {$gt: 2}}}]}, {a: 1});
+  nomatch({$and: [{a: {$not: {$lt: 2}}}, {a: {$not: {$gt: 0}}}]}, {a: 1});
+
+  // $where
+  match({$where: "this.a === 1"}, {a: 1});
+  match({$where: "obj.a === 1"}, {a: 1});
+  nomatch({$where: "this.a !== 1"}, {a: 1});
+  nomatch({$where: "obj.a !== 1"}, {a: 1});
+  nomatch({$where: "this.a === 1", a: 2}, {a: 1});
+  match({$where: "this.a === 1", b: 2}, {a: 1, b: 2});
+  match({$where: "this.a === 1 && this.b === 2"}, {a: 1, b: 2});
+  match({$where: "this.a instanceof Array"}, {a: []});
+  nomatch({$where: "this.a instanceof Array"}, {a: 1});
+
+  // reaching into array
+  match({"dogs.0.name": "Fido"}, {dogs: [{name: "Fido"}, {name: "Rex"}]});
+  match({"dogs.1.name": "Rex"}, {dogs: [{name: "Fido"}, {name: "Rex"}]});
+  nomatch({"dogs.1.name": "Fido"}, {dogs: [{name: "Fido"}, {name: "Rex"}]});
+  match({"room.1b": "bla"}, {room: {"1b": "bla"}});
+
+  match({"dogs.name": "Fido"}, {dogs: [{name: "Fido"}, {name: "Rex"}]});
+  match({"dogs.name": "Rex"}, {dogs: [{name: "Fido"}, {name: "Rex"}]});
+  match({"animals.dogs.name": "Fido"},
+        {animals: [{dogs: [{name: "Rover"}]},
+                   {},
+                   {dogs: [{name: "Fido"}, {name: "Rex"}]}]});
+  match({"animals.dogs.name": "Fido"},
+        {animals: [{dogs: {name: "Rex"}},
+                   {dogs: {name: "Fido"}}]});
+  match({"animals.dogs.name": "Fido"},
+        {animals: [{dogs: [{name: "Rover"}]},
+                   {},
+                   {dogs: [{name: ["Fido"]}, {name: "Rex"}]}]});
+  nomatch({"dogs.name": "Fido"}, {dogs: []});
+
+  // $elemMatch
+  match({dogs: {$elemMatch: {name: /e/}}},
+        {dogs: [{name: "Fido"}, {name: "Rex"}]});
+  nomatch({dogs: {$elemMatch: {name: /a/}}},
+          {dogs: [{name: "Fido"}, {name: "Rex"}]});
+  match({dogs: {$elemMatch: {age: {$gt: 4}}}},
+        {dogs: [{name: "Fido", age: 5}, {name: "Rex", age: 3}]});
+  match({dogs: {$elemMatch: {name: "Fido", age: {$gt: 4}}}},
+        {dogs: [{name: "Fido", age: 5}, {name: "Rex", age: 3}]});
+  nomatch({dogs: {$elemMatch: {name: "Fido", age: {$gt: 5}}}},
+          {dogs: [{name: "Fido", age: 5}, {name: "Rex", age: 3}]});
+  match({dogs: {$elemMatch: {name: /i/, age: {$gt: 4}}}},
+        {dogs: [{name: "Fido", age: 5}, {name: "Rex", age: 3}]});
+  nomatch({dogs: {$elemMatch: {name: /e/, age: 5}}},
+          {dogs: [{name: "Fido", age: 5}, {name: "Rex", age: 3}]});
+  match({x: {$elemMatch: {y: 9}}}, {x: [{y: 9}]});
+  nomatch({x: {$elemMatch: {y: 9}}}, {x: [[{y: 9}]]});
+  match({x: {$elemMatch: {$gt: 5, $lt: 9}}}, {x: [8]});
+  nomatch({x: {$elemMatch: {$gt: 5, $lt: 9}}}, {x: [[8]]});
+  match({'a.x': {$elemMatch: {y: 9}}},
+        {a: [{x: []}, {x: [{y: 9}]}]});
+  nomatch({a: {$elemMatch: {x: 5}}}, {a: {x: 5}});
+  match({a: {$elemMatch: {0: {$gt: 5, $lt: 9}}}}, {a: [[6]]});
+  match({a: {$elemMatch: {'0.b': {$gt: 5, $lt: 9}}}}, {a: [[{b:6}]]});
+  match({a: {$elemMatch: {x: 1, $or: [{a: 1}, {b: 1}]}}},
+        {a: [{x: 1, b: 1}]});
+  match({a: {$elemMatch: {$or: [{a: 1}, {b: 1}], x: 1}}},
+        {a: [{x: 1, b: 1}]});
+  match({a: {$elemMatch: {$or: [{a: 1}, {b: 1}]}}},
+        {a: [{x: 1, b: 1}]});
+  match({a: {$elemMatch: {$or: [{a: 1}, {b: 1}]}}},
+        {a: [{x: 1, b: 1}]});
+  match({a: {$elemMatch: {$and: [{b: 1}, {x: 1}]}}},
+        {a: [{x: 1, b: 1}]});
+  nomatch({a: {$elemMatch: {x: 1, $or: [{a: 1}, {b: 1}]}}},
+          {a: [{b: 1}]});
+  nomatch({a: {$elemMatch: {x: 1, $or: [{a: 1}, {b: 1}]}}},
+          {a: [{x: 1}]});
+  nomatch({a: {$elemMatch: {x: 1, $or: [{a: 1}, {b: 1}]}}},
+          {a: [{x: 1}, {b: 1}]});
+
+  test.throws(function () {
+    match({a: {$elemMatch: {$gte: 1, $or: [{a: 1}, {b: 1}]}}},
+          {a: [{x: 1, b: 1}]});
+  });
+
+  test.throws(function () {
+    match({x: {$elemMatch: {$and: [{$gt: 5, $lt: 9}]}}}, {x: [8]});
+  });
+
+  // $comment
+  match({a: 5, $comment: "asdf"}, {a: 5});
+  nomatch({a: 6, $comment: "asdf"}, {a: 5});
+
+  // XXX still needs tests:
+  // - non-scalar arguments to $gt, $lt, etc
+});
+
+Tinytest.add("minimongo - projection_compiler", function (test) {
+  var testProjection = function (projection, tests) {
+    var projection_f = LocalCollection._compileProjection(projection);
+    var equalNonStrict = function (a, b, desc) {
+      test.isTrue(_.isEqual(a, b), desc);
+    };
+
+    _.each(tests, function (testCase) {
+      equalNonStrict(projection_f(testCase[0]), testCase[1], testCase[2]);
+    });
+  };
+
+  var testCompileProjectionThrows = function (projection, expectedError) {
+    test.throws(function () {
+      LocalCollection._compileProjection(projection);
+    }, expectedError);
+  };
+
+  testProjection({ 'foo': 1, 'bar': 1 }, [
+    [{ foo: 42, bar: "something", baz: "else" },
+     { foo: 42, bar: "something" },
+     "simplest - whitelist"],
+
+    [{ foo: { nested: 17 }, baz: {} },
+     { foo: { nested: 17 } },
+     "nested whitelisted field"],
+
+    [{ _id: "uid", bazbaz: 42 },
+     { _id: "uid" },
+     "simplest whitelist - preserve _id"]
+  ]);
+
+  testProjection({ 'foo': 0, 'bar': 0 }, [
+    [{ foo: 42, bar: "something", baz: "else" },
+     { baz: "else" },
+     "simplest - blacklist"],
+
+    [{ foo: { nested: 17 }, baz: { foo: "something" } },
+     { baz: { foo: "something" } },
+     "nested blacklisted field"],
+
+    [{ _id: "uid", bazbaz: 42 },
+     { _id: "uid", bazbaz: 42 },
+     "simplest blacklist - preserve _id"]
+  ]);
+
+  testProjection({ _id: 0, foo: 1 }, [
+    [{ foo: 42, bar: 33, _id: "uid" },
+     { foo: 42 },
+     "whitelist - _id blacklisted"]
+  ]);
+
+  testProjection({ _id: 0, foo: 0 }, [
+    [{ foo: 42, bar: 33, _id: "uid" },
+     { bar: 33 },
+     "blacklist - _id blacklisted"]
+  ]);
+
+  testProjection({ 'foo.bar.baz': 1 }, [
+    [{ foo: { meh: "fur", bar: { baz: 42 }, tr: 1 }, bar: 33, baz: 'trolololo' },
+     { foo: { bar: { baz: 42 } } },
+     "whitelist nested"],
+
+    // Behavior of this test is looked up in actual mongo
+    [{ foo: { meh: "fur", bar: "nope", tr: 1 }, bar: 33, baz: 'trolololo' },
+     { foo: {} },
+     "whitelist nested - path not found in doc, different type"],
+
+    // Behavior of this test is looked up in actual mongo
+    [{ foo: { meh: "fur", bar: [], tr: 1 }, bar: 33, baz: 'trolololo' },
+     { foo: { bar: [] } },
+     "whitelist nested - path not found in doc"]
+  ]);
+
+  testProjection({ 'hope.humanity': 0, 'hope.people': 0 }, [
+    [{ hope: { humanity: "lost", people: 'broken', candies: 'long live!' } },
+     { hope: { candies: 'long live!' } },
+     "blacklist nested"],
+
+    [{ hope: "new" },
+     { hope: "new" },
+     "blacklist nested - path not found in doc"]
+  ]);
+
+  testProjection({ _id: 1 }, [
+    [{ _id: 42, x: 1, y: { z: "2" } },
+     { _id: 42 },
+     "_id whitelisted"],
+    [{ _id: 33 },
+     { _id: 33 },
+     "_id whitelisted, _id only"],
+    [{ x: 1 },
+     {},
+     "_id whitelisted, no _id"]
+  ]);
+
+  testProjection({ _id: 0 }, [
+    [{ _id: 42, x: 1, y: { z: "2" } },
+     { x: 1, y: { z: "2" } },
+     "_id blacklisted"],
+    [{ _id: 33 },
+     {},
+     "_id blacklisted, _id only"],
+    [{ x: 1 },
+     { x: 1 },
+     "_id blacklisted, no _id"]
+  ]);
+
+  testProjection({}, [
+    [{ a: 1, b: 2, c: "3" },
+     { a: 1, b: 2, c: "3" },
+     "empty projection"]
+  ]);
+
+  testCompileProjectionThrows(
+    { 'inc': 1, 'excl': 0 },
+    "You cannot currently mix including and excluding fields");
+  testCompileProjectionThrows(
+    { _id: 1, a: 0 },
+    "You cannot currently mix including and excluding fields");
+
+  testCompileProjectionThrows(
+    { 'a': 1, 'a.b': 1 },
+    "using both of them may trigger unexpected behavior");
+  testCompileProjectionThrows(
+    { 'a.b.c': 1, 'a.b': 1, 'a': 1 },
+    "using both of them may trigger unexpected behavior");
+
+  testCompileProjectionThrows("some string", "fields option must be an object");
+});
+
+Tinytest.add("minimongo - fetch with fields", function (test) {
+  var c = new LocalCollection();
+  _.times(30, function (i) {
+    c.insert({
+      something: Random.id(),
+      anything: {
+        foo: "bar",
+        cool: "hot"
+      },
+      nothing: i,
+      i: i
+    });
+  });
+
+  // Test just a regular fetch with some projection
+  var fetchResults = c.find({}, { fields: {
+    'something': 1,
+    'anything.foo': 1
+  } }).fetch();
+
+  test.isTrue(_.all(fetchResults, function (x) {
+    return x &&
+           x.something &&
+           x.anything &&
+           x.anything.foo &&
+           x.anything.foo === "bar" &&
+           !_.has(x, 'nothing') &&
+           !_.has(x.anything, 'cool');
+  }));
+
+  // Test with a selector, even field used in the selector is excluded in the
+  // projection
+  fetchResults = c.find({
+    nothing: { $gte: 5 }
+  }, {
+    fields: { nothing: 0 }
+  }).fetch();
+
+  test.isTrue(_.all(fetchResults, function (x) {
+    return x &&
+           x.something &&
+           x.anything &&
+           x.anything.foo === "bar" &&
+           x.anything.cool === "hot" &&
+           !_.has(x, 'nothing') &&
+           x.i &&
+           x.i >= 5;
+  }));
+
+  test.isTrue(fetchResults.length === 25);
+
+  // Test that we can sort, based on field excluded from the projection, use
+  // skip and limit as well!
+  // following find will get indexes [10..20) sorted by nothing
+  fetchResults = c.find({}, {
+    sort: {
+      nothing: 1
+    },
+    limit: 10,
+    skip: 10,
+    fields: {
+      i: 1,
+      something: 1
+    }
+  }).fetch();
+
+  test.isTrue(_.all(fetchResults, function (x) {
+    return x &&
+           x.something &&
+           x.i >= 10 && x.i < 20;
+  }));
+
+  _.each(fetchResults, function (x, i, arr) {
+    if (!i) return;
+    test.isTrue(x.i === arr[i-1].i + 1);
+  });
+
+  // Temporary unsupported operators
+  // queries are taken from MongoDB docs examples
+  test.throws(function () {
+    c.find({}, { fields: { 'grades.$': 1 } });
+  });
+  test.throws(function () {
+    c.find({}, { fields: { grades: { $elemMatch: { mean: 70 } } } });
+  });
+  test.throws(function () {
+    c.find({}, { fields: { grades: { $slice: [20, 10] } } });
+  });
+});
+
+Tinytest.add("minimongo - fetch with projection, subarrays", function (test) {
+  // Apparently projection of type 'foo.bar.x' for
+  // { foo: [ { bar: { x: 42 } }, { bar: { x: 3 } } ] }
+  // should return exactly this object. More precisely, arrays are considered as
+  // sets and are queried separately and then merged back to result set
+  var c = new LocalCollection();
+
+  // Insert a test object with two set fields
+  c.insert({
+    setA: [{
+      fieldA: 42,
+      fieldB: 33
+    }, {
+      fieldA: "the good",
+      fieldB: "the bad",
+      fieldC: "the ugly"
+    }],
+    setB: [{
+      anotherA: { },
+      anotherB: "meh"
+    }, {
+      anotherA: 1234,
+      anotherB: 431
+    }]
+  });
+
+  var equalNonStrict = function (a, b, desc) {
+    test.isTrue(_.isEqual(a, b), desc);
+  };
+
+  var testForProjection = function (projection, expected) {
+    var fetched = c.find({}, { fields: projection }).fetch()[0];
+    equalNonStrict(fetched, expected, "failed sub-set projection: " +
+                                      JSON.stringify(projection));
+  };
+
+  testForProjection({ 'setA.fieldA': 1, 'setB.anotherB': 1, _id: 0 },
+                    {
+                      setA: [{ fieldA: 42 }, { fieldA: "the good" }],
+                      setB: [{ anotherB: "meh" }, { anotherB: 431 }]
+                    });
+
+  testForProjection({ 'setA.fieldA': 0, 'setB.anotherA': 0, _id: 0 },
+                    {
+                      setA: [{fieldB:33}, {fieldB:"the bad",fieldC:"the ugly"}],
+                      setB: [{ anotherB: "meh" }, { anotherB: 431 }]
+                    });
+
+  c.remove({});
+  c.insert({a:[[{b:1,c:2},{b:2,c:4}],{b:3,c:5},[{b:4, c:9}]]});
+
+  testForProjection({ 'a.b': 1, _id: 0 },
+                    {a: [ [ { b: 1 }, { b: 2 } ], { b: 3 }, [ { b: 4 } ] ] });
+  testForProjection({ 'a.b': 0, _id: 0 },
+                    {a: [ [ { c: 2 }, { c: 4 } ], { c: 5 }, [ { c: 9 } ] ] });
+});
+
+Tinytest.add("minimongo - fetch with projection, deep copy", function (test) {
+  // Compiled fields projection defines the contract: returned document doesn't
+  // retain anything from the passed argument.
+  var doc = {
+    a: { x: 42 },
+    b: {
+      y: { z: 33 }
+    },
+    c: "asdf"
+  };
+
+  var fields = {
+    'a': 1,
+    'b.y': 1
+  };
+
+  var projectionFn = LocalCollection._compileProjection(fields);
+  var filteredDoc = projectionFn(doc);
+  doc.a.x++;
+  doc.b.y.z--;
+  test.equal(filteredDoc.a.x, 42, "projection returning deep copy - including");
+  test.equal(filteredDoc.b.y.z, 33, "projection returning deep copy - including");
+
+  fields = { c: 0 };
+  projectionFn = LocalCollection._compileProjection(fields);
+  filteredDoc = projectionFn(doc);
+
+  doc.a.x = 5;
+  test.equal(filteredDoc.a.x, 43, "projection returning deep copy - excluding");
+});
+
+Tinytest.add("minimongo - observe ordered with projection", function (test) {
+  // These tests are copy-paste from "minimongo -observe ordered",
+  // slightly modified to test projection
+  var operations = [];
+  var cbs = log_callbacks(operations);
+  var handle;
+
+  var c = new LocalCollection();
+  handle = c.find({}, {sort: {a: 1}, fields: { a: 1 }}).observe(cbs);
+  test.isTrue(handle.collection === c);
+
+  c.insert({_id: 'foo', a:1, b:2});
+  test.equal(operations.shift(), ['added', {a:1}, 0, null]);
+  c.update({a:1}, {$set: {a: 2, b: 1}});
+  test.equal(operations.shift(), ['changed', {a:2}, 0, {a:1}]);
+  c.insert({_id: 'bar', a:10, c: 33});
+  test.equal(operations.shift(), ['added', {a:10}, 1, null]);
+  c.update({}, {$inc: {a: 1}}, {multi: true});
+  c.update({}, {$inc: {c: 1}}, {multi: true});
+  test.equal(operations.shift(), ['changed', {a:3}, 0, {a:2}]);
+  test.equal(operations.shift(), ['changed', {a:11}, 1, {a:10}]);
+  c.update({a:11}, {a:1, b:44});
+  test.equal(operations.shift(), ['changed', {a:1}, 1, {a:11}]);
+  test.equal(operations.shift(), ['moved', {a:1}, 1, 0, 'foo']);
+  c.remove({a:2});
+  test.equal(operations.shift(), undefined);
+  c.remove({a:3});
+  test.equal(operations.shift(), ['removed', 'foo', 1, {a:3}]);
+
+  // test stop
+  handle.stop();
+  var idA2 = Random.id();
+  c.insert({_id: idA2, a:2});
+  test.equal(operations.shift(), undefined);
+
+  var cursor = c.find({}, {fields: {a: 1, _id: 0}});
+  test.throws(function () {
+    cursor.observeChanges({added: function () {}});
+  });
+  test.throws(function () {
+    cursor.observe({added: function () {}});
+  });
+
+  // test initial inserts (and backwards sort)
+  handle = c.find({}, {sort: {a: -1}, fields: { a: 1 } }).observe(cbs);
+  test.equal(operations.shift(), ['added', {a:2}, 0, null]);
+  test.equal(operations.shift(), ['added', {a:1}, 1, null]);
+  handle.stop();
+
+  // test _suppress_initial
+  handle = c.find({}, {sort: {a: -1}, fields: { a: 1 }}).observe(_.extend(cbs, {_suppress_initial: true}));
+  test.equal(operations.shift(), undefined);
+  c.insert({a:100, b: { foo: "bar" }});
+  test.equal(operations.shift(), ['added', {a:100}, 0, idA2]);
+  handle.stop();
+
+  // test skip and limit.
+  c.remove({});
+  handle = c.find({}, {sort: {a: 1}, skip: 1, limit: 2, fields: { 'blacklisted': 0 }}).observe(cbs);
+  test.equal(operations.shift(), undefined);
+  c.insert({a:1, blacklisted:1324});
+  test.equal(operations.shift(), undefined);
+  c.insert({_id: 'foo', a:2, blacklisted:["something"]});
+  test.equal(operations.shift(), ['added', {a:2}, 0, null]);
+  c.insert({a:3, blacklisted: { 2: 3 }});
+  test.equal(operations.shift(), ['added', {a:3}, 1, null]);
+  c.insert({a:4, blacklisted: 6});
+  test.equal(operations.shift(), undefined);
+  c.update({a:1}, {a:0, blacklisted:4444});
+  test.equal(operations.shift(), undefined);
+  c.update({a:0}, {a:5, blacklisted:11111});
+  test.equal(operations.shift(), ['removed', 'foo', 0, {a:2}]);
+  test.equal(operations.shift(), ['added', {a:4}, 1, null]);
+  c.update({a:3}, {a:3.5, blacklisted:333.4444});
+  test.equal(operations.shift(), ['changed', {a:3.5}, 0, {a:3}]);
+  handle.stop();
+
+  // test _no_indices
+
+  c.remove({});
+  handle = c.find({}, {sort: {a: 1}, fields: { a: 1 }}).observe(_.extend(cbs, {_no_indices: true}));
+  c.insert({_id: 'foo', a:1, zoo: "crazy"});
+  test.equal(operations.shift(), ['added', {a:1}, -1, null]);
+  c.update({a:1}, {$set: {a: 2, foobar: "player"}});
+  test.equal(operations.shift(), ['changed', {a:2}, -1, {a:1}]);
+  c.insert({a:10, b:123.45});
+  test.equal(operations.shift(), ['added', {a:10}, -1, null]);
+  c.update({}, {$inc: {a: 1, b:2}}, {multi: true});
+  test.equal(operations.shift(), ['changed', {a:3}, -1, {a:2}]);
+  test.equal(operations.shift(), ['changed', {a:11}, -1, {a:10}]);
+  c.update({a:11, b:125.45}, {a:1, b:444});
+  test.equal(operations.shift(), ['changed', {a:1}, -1, {a:11}]);
+  test.equal(operations.shift(), ['moved', {a:1}, -1, -1, 'foo']);
+  c.remove({a:2});
+  test.equal(operations.shift(), undefined);
+  c.remove({a:3});
+  test.equal(operations.shift(), ['removed', 'foo', -1, {a:3}]);
+  handle.stop();
+});
+
+
+Tinytest.add("minimongo - ordering", function (test) {
+  var shortBinary = EJSON.newBinary(1);
+  shortBinary[0] = 128;
+  var longBinary1 = EJSON.newBinary(2);
+  longBinary1[1] = 42;
+  var longBinary2 = EJSON.newBinary(2);
+  longBinary2[1] = 50;
+
+  var date1 = new Date;
+  var date2 = new Date(date1.getTime() + 1000);
+
+  // value ordering
+  assert_ordering(test, LocalCollection._f._cmp, [
+    null,
+    1, 2.2, 3,
+    "03", "1", "11", "2", "a", "aaa",
+    {}, {a: 2}, {a: 3}, {a: 3, b: 4}, {b: 4}, {b: 4, a: 3},
+    {b: {}}, {b: [1, 2, 3]}, {b: [1, 2, 4]},
+    [], [1, 2], [1, 2, 3], [1, 2, 4], [1, 2, "4"], [1, 2, [4]],
+    shortBinary, longBinary1, longBinary2,
+    new MongoID.ObjectID("1234567890abcd1234567890"),
+    new MongoID.ObjectID("abcd1234567890abcd123456"),
+    false, true,
+    date1, date2
+  ]);
+
+  // document ordering under a sort specification
+  var verify = function (sorts, docs) {
+    _.each(_.isArray(sorts) ? sorts : [sorts], function (sort) {
+      var sorter = new Minimongo.Sorter(sort);
+      assert_ordering(test, sorter.getComparator(), docs);
+    });
+  };
+
+  // note: [] doesn't sort with "arrays", it sorts as "undefined". the position
+  // of arrays in _typeorder only matters for things like $lt. (This behavior
+  // verified with MongoDB 2.2.1.) We don't define the relative order of {a: []}
+  // and {c: 1} is undefined (MongoDB does seem to care but it's not clear how
+  // or why).
+  verify([{"a" : 1}, ["a"], [["a", "asc"]]],
+         [{a: []}, {a: 1}, {a: {}}, {a: true}]);
+  verify([{"a" : 1}, ["a"], [["a", "asc"]]],
+         [{c: 1}, {a: 1}, {a: {}}, {a: true}]);
+  verify([{"a" : -1}, [["a", "desc"]]],
+         [{a: true}, {a: {}}, {a: 1}, {c: 1}]);
+  verify([{"a" : -1}, [["a", "desc"]]],
+         [{a: true}, {a: {}}, {a: 1}, {a: []}]);
+
+  verify([{"a" : 1, "b": -1}, ["a", ["b", "desc"]],
+          [["a", "asc"], ["b", "desc"]]],
+         [{c: 1}, {a: 1, b: 3}, {a: 1, b: 2}, {a: 2, b: 0}]);
+
+  verify([{"a" : 1, "b": 1}, ["a", "b"],
+          [["a", "asc"], ["b", "asc"]]],
+         [{c: 1}, {a: 1, b: 2}, {a: 1, b: 3}, {a: 2, b: 0}]);
+
+  test.throws(function () {
+    new Minimongo.Sorter("a");
+  });
+
+  test.throws(function () {
+    new Minimongo.Sorter(123);
+  });
+
+  // We don't support $natural:1 (since we don't actually have Mongo's on-disk
+  // ordering available!)
+  test.throws(function () {
+    new Minimongo.Sorter({$natural: 1});
+  });
+
+  // No sort spec implies everything equal.
+  test.equal(new Minimongo.Sorter({}).getComparator()({a:1}, {a:2}), 0);
+
+  // All sorts of array edge cases!
+  // Increasing sort sorts by the smallest element it finds; 1 < 2.
+  verify({a: 1}, [
+    {a: [1, 10, 20]},
+    {a: [5, 2, 99]}
+  ]);
+  // Decreasing sorts by largest it finds; 99 > 20.
+  verify({a: -1}, [
+    {a: [5, 2, 99]},
+    {a: [1, 10, 20]}
+  ]);
+  // Can also sort by specific array indices.
+  verify({'a.1': 1}, [
+    {a: [5, 2, 99]},
+    {a: [1, 10, 20]}
+  ]);
+  // We do NOT expand sub-arrays, so the minimum in the second doc is 5, not
+  // -20. (Numbers always sort before arrays.)
+  verify({a: 1}, [
+    {a: [1, [10, 15], 20]},
+    {a: [5, [-5, -20], 18]}
+  ]);
+  // The maximum in each of these is the array, since arrays are "greater" than
+  // numbers. And [10, 15] is greater than [-5, -20].
+  verify({a: -1}, [
+    {a: [1, [10, 15], 20]},
+    {a: [5, [-5, -20], 18]}
+  ]);
+  // 'a.0' here ONLY means "first element of a", not "first element of something
+  // found in a", so it CANNOT find the 10 or -5.
+  verify({'a.0': 1}, [
+    {a: [1, [10, 15], 20]},
+    {a: [5, [-5, -20], 18]}
+  ]);
+  verify({'a.0': -1}, [
+    {a: [5, [-5, -20], 18]},
+    {a: [1, [10, 15], 20]}
+  ]);
+  // Similarly, this is just comparing [-5,-20] to [10, 15].
+  verify({'a.1': 1}, [
+    {a: [5, [-5, -20], 18]},
+    {a: [1, [10, 15], 20]}
+  ]);
+  verify({'a.1': -1}, [
+    {a: [1, [10, 15], 20]},
+    {a: [5, [-5, -20], 18]}
+  ]);
+  // Here we are just comparing [10,15] directly to [19,3] (and NOT also
+  // iterating over the numbers; this is implemented by setting dontIterate in
+  // makeLookupFunction).  So [10,15]<[19,3] even though 3 is the smallest
+  // number you can find there.
+  verify({'a.1': 1}, [
+    {a: [1, [10, 15], 20]},
+    {a: [5, [19, 3], 18]}
+  ]);
+  verify({'a.1': -1}, [
+    {a: [5, [19, 3], 18]},
+    {a: [1, [10, 15], 20]}
+  ]);
+  // Minimal elements are 1 and 5.
+  verify({a: 1}, [
+    {a: [1, [10, 15], 20]},
+    {a: [5, [19, 3], 18]}
+  ]);
+  // Maximal elements are [19,3] and [10,15] (because arrays sort higher than
+  // numbers), even though there's a 20 floating around.
+  verify({a: -1}, [
+    {a: [5, [19, 3], 18]},
+    {a: [1, [10, 15], 20]}
+  ]);
+  // Maximal elements are [10,15] and [3,19].  [10,15] is bigger even though 19
+  // is the biggest number in them, because array comparison is lexicographic.
+  verify({a: -1}, [
+    {a: [1, [10, 15], 20]},
+    {a: [5, [3, 19], 18]}
+  ]);
+
+  // (0,4) < (0,5), so they go in this order.  It's not correct to consider
+  // (0,3) as a sort key for the second document because they come from
+  // different a-branches.
+  verify({'a.x': 1, 'a.y': 1}, [
+    {a: [{x: 0, y: 4}]},
+    {a: [{x: 0, y: 5}, {x: 1, y: 3}]}
+  ]);
+
+  verify({'a.0.s': 1}, [
+    {a: [ {s: 1} ]},
+    {a: [ {s: 2} ]}
+  ]);
+});
+
+Tinytest.add("minimongo - sort", function (test) {
+  var c = new LocalCollection();
+  for (var i = 0; i < 50; i++)
+    for (var j = 0; j < 2; j++)
+      c.insert({a: i, b: j, _id: i + "_" + j});
+
+  test.equal(
+    c.find({a: {$gt: 10}}, {sort: {b: -1, a: 1}, limit: 5}).fetch(), [
+      {a: 11, b: 1, _id: "11_1"},
+      {a: 12, b: 1, _id: "12_1"},
+      {a: 13, b: 1, _id: "13_1"},
+      {a: 14, b: 1, _id: "14_1"},
+      {a: 15, b: 1, _id: "15_1"}]);
+
+  test.equal(
+    c.find({a: {$gt: 10}}, {sort: {b: -1, a: 1}, skip: 3, limit: 5}).fetch(), [
+      {a: 14, b: 1, _id: "14_1"},
+      {a: 15, b: 1, _id: "15_1"},
+      {a: 16, b: 1, _id: "16_1"},
+      {a: 17, b: 1, _id: "17_1"},
+      {a: 18, b: 1, _id: "18_1"}]);
+
+  test.equal(
+    c.find({a: {$gte: 20}}, {sort: {a: 1, b: -1}, skip: 50, limit: 5}).fetch(), [
+      {a: 45, b: 1, _id: "45_1"},
+      {a: 45, b: 0, _id: "45_0"},
+      {a: 46, b: 1, _id: "46_1"},
+      {a: 46, b: 0, _id: "46_0"},
+      {a: 47, b: 1, _id: "47_1"}]);
+});
+
+Tinytest.add("minimongo - subkey sort", function (test) {
+  var c = new LocalCollection();
+
+  // normal case
+  c.insert({a: {b: 2}});
+  c.insert({a: {b: 1}});
+  c.insert({a: {b: 3}});
+  test.equal(
+    _.pluck(c.find({}, {sort: {'a.b': -1}}).fetch(), 'a'),
+    [{b: 3}, {b: 2}, {b: 1}]);
+
+  // isn't an object
+  c.insert({a: 1});
+  test.equal(
+    _.pluck(c.find({}, {sort: {'a.b': 1}}).fetch(), 'a'),
+    [1, {b: 1}, {b: 2}, {b: 3}]);
+
+  // complex object
+  c.insert({a: {b: {c: 1}}});
+  test.equal(
+    _.pluck(c.find({}, {sort: {'a.b': -1}}).fetch(), 'a'),
+    [{b: {c: 1}}, {b: 3}, {b: 2}, {b: 1}, 1]);
+
+  // no such top level prop
+  c.insert({c: 1});
+  test.equal(
+    _.pluck(c.find({}, {sort: {'a.b': -1}}).fetch(), 'a'),
+    [{b: {c: 1}}, {b: 3}, {b: 2}, {b: 1}, 1, undefined]);
+
+  // no such mid level prop. just test that it doesn't throw.
+  test.equal(c.find({}, {sort: {'a.nope.c': -1}}).count(), 6);
+});
+
+Tinytest.add("minimongo - array sort", function (test) {
+  var c = new LocalCollection();
+
+  // "up" and "down" are the indices that the docs should have when sorted
+  // ascending and descending by "a.x" respectively. They are not reverses of
+  // each other: when sorting ascending, you use the minimum value you can find
+  // in the document, and when sorting descending, you use the maximum value you
+  // can find. So [1, 4] shows up in the 1 slot when sorting ascending and the 4
+  // slot when sorting descending.
+  //
+  // Similarly, "selected" is the index that the doc should have in the query
+  // that sorts ascending on "a.x" and selects {'a.x': {$gt: 1}}. In this case,
+  // the 1 in [1, 4] may not be used as a sort key.
+  c.insert({up: 1, down: 1, selected: 2, a: {x: [1, 4]}});
+  c.insert({up: 2, down: 2, selected: 0, a: [{x: [2]}, {x: 3}]});
+  c.insert({up: 0, down: 4,              a: {x: 0}});
+  c.insert({up: 3, down: 3, selected: 1, a: {x: 2.5}});
+  c.insert({up: 4, down: 0, selected: 3, a: {x: 5}});
+
+  // Test that the the documents in "cursor" contain values with the name
+  // "field" running from 0 to the max value of that name in the collection.
+  var testCursorMatchesField = function (cursor, field) {
+    var fieldValues = [];
+    c.find().forEach(function (doc) {
+      if (_.has(doc, field))
+        fieldValues.push(doc[field]);
+    });
+    test.equal(_.pluck(cursor.fetch(), field),
+               _.range(_.max(fieldValues) + 1));
+  };
+
+  testCursorMatchesField(c.find({}, {sort: {'a.x': 1}}), 'up');
+  testCursorMatchesField(c.find({}, {sort: {'a.x': -1}}), 'down');
+  testCursorMatchesField(c.find({'a.x': {$gt: 1}}, {sort: {'a.x': 1}}),
+                         'selected');
+});
+
+Tinytest.add("minimongo - sort keys", function (test) {
+  var keyListToObject = function (keyList) {
+    var obj = {};
+    _.each(keyList, function (key) {
+      obj[EJSON.stringify(key)] = true;
+    });
+    return obj;
+  };
+
+  var testKeys = function (sortSpec, doc, expectedKeyList) {
+    var expectedKeys = keyListToObject(expectedKeyList);
+    var sorter = new Minimongo.Sorter(sortSpec);
+
+    var actualKeyList = [];
+    sorter._generateKeysFromDoc(doc, function (key) {
+      actualKeyList.push(key);
+    });
+    var actualKeys = keyListToObject(actualKeyList);
+    test.equal(actualKeys, expectedKeys);
+  };
+
+  var testParallelError = function (sortSpec, doc) {
+    var sorter = new Minimongo.Sorter(sortSpec);
+    test.throws(function () {
+      sorter._generateKeysFromDoc(doc, function (){});
+    }, /parallel arrays/);
+  };
+
+  // Just non-array fields.
+  testKeys({'a.x': 1, 'a.y': 1},
+           {a: {x: 0, y: 5}},
+           [[0,5]]);
+
+  // Ensure that we don't get [0,3] and [1,5].
+  testKeys({'a.x': 1, 'a.y': 1},
+           {a: [{x: 0, y: 5}, {x: 1, y: 3}]},
+           [[0,5], [1,3]]);
+
+  // Ensure we can combine "array fields" with "non-array fields".
+  testKeys({'a.x': 1, 'a.y': 1, b: -1},
+           {a: [{x: 0, y: 5}, {x: 1, y: 3}], b: 42},
+           [[0,5,42], [1,3,42]]);
+  testKeys({b: -1, 'a.x': 1, 'a.y': 1},
+           {a: [{x: 0, y: 5}, {x: 1, y: 3}], b: 42},
+           [[42,0,5], [42,1,3]]);
+  testKeys({'a.x': 1, b: -1, 'a.y': 1},
+           {a: [{x: 0, y: 5}, {x: 1, y: 3}], b: 42},
+           [[0,42,5], [1,42,3]]);
+  testKeys({a: 1, b: 1},
+           {a: [1, 2, 3], b: 42},
+           [[1,42], [2,42], [3,42]]);
+
+  // Don't support multiple arrays at the same level.
+  testParallelError({a: 1, b: 1},
+                    {a: [1, 2, 3], b: [42]});
+
+  // We are MORE STRICT than Mongo here; Mongo supports this!
+  // XXX support this too  #NestedArraySort
+  testParallelError({'a.x': 1, 'a.y': 1},
+                    {a: [{x: 1, y: [2, 3]},
+                         {x: 2, y: [4, 5]}]});
+});
+
+Tinytest.add("minimongo - sort key filter", function (test) {
+  var testOrder = function (sortSpec, selector, doc1, doc2) {
+    var matcher = new Minimongo.Matcher(selector);
+    var sorter = new Minimongo.Sorter(sortSpec, {matcher: matcher});
+    var comparator = sorter.getComparator();
+    var comparison = comparator(doc1, doc2);
+    test.isTrue(comparison < 0);
+  };
+
+  testOrder({'a.x': 1}, {'a.x': {$gt: 1}},
+            {a: {x: 3}},
+            {a: {x: [1, 4]}});
+  testOrder({'a.x': 1}, {'a.x': {$gt: 0}},
+            {a: {x: [1, 4]}},
+            {a: {x: 3}});
+
+  var keyCompatible = function (sortSpec, selector, key, compatible) {
+    var matcher = new Minimongo.Matcher(selector);
+    var sorter = new Minimongo.Sorter(sortSpec, {matcher: matcher});
+    var actual = sorter._keyCompatibleWithSelector(key);
+    test.equal(actual, compatible);
+  };
+
+  keyCompatible({a: 1}, {a: 5}, [5], true);
+  keyCompatible({a: 1}, {a: 5}, [8], false);
+  keyCompatible({a: 1}, {a: {x: 5}}, [{x: 5}], true);
+  keyCompatible({a: 1}, {a: {x: 5}}, [{x: 5, y: 9}], false);
+  keyCompatible({'a.x': 1}, {a: {x: 5}}, [5], true);
+  // To confirm this:
+  //   > db.x.insert({_id: "q", a: [{x:1}, {x:5}], b: 2})
+  //   > db.x.insert({_id: "w", a: [{x:5}, {x:10}], b: 1})
+  //   > db.x.find({}).sort({'a.x': 1, b: 1})
+  //   { "_id" : "q", "a" : [  {  "x" : 1 },  {  "x" : 5 } ], "b" : 2 }
+  //   { "_id" : "w", "a" : [  {  "x" : 5 },  {  "x" : 10 } ], "b" : 1 }
+  //   > db.x.find({a: {x:5}}).sort({'a.x': 1, b: 1})
+  //   { "_id" : "q", "a" : [  {  "x" : 1 },  {  "x" : 5 } ], "b" : 2 }
+  //   { "_id" : "w", "a" : [  {  "x" : 5 },  {  "x" : 10 } ], "b" : 1 }
+  //   > db.x.find({'a.x': 5}).sort({'a.x': 1, b: 1})
+  //   { "_id" : "w", "a" : [  {  "x" : 5 },  {  "x" : 10 } ], "b" : 1 }
+  //   { "_id" : "q", "a" : [  {  "x" : 1 },  {  "x" : 5 } ], "b" : 2 }
+  // ie, only the last one manages to trigger the key compatibility code,
+  // not the previous one.  (The "b" sort is necessary because when the key
+  // compatibility code *does* kick in, both documents only end up with "5"
+  // for the first field as their only sort key, and we need to differentiate
+  // somehow...)
+  keyCompatible({'a.x': 1}, {a: {x: 5}}, [1], true);
+  keyCompatible({'a.x': 1}, {'a.x': 5}, [5], true);
+  keyCompatible({'a.x': 1}, {'a.x': 5}, [1], false);
+
+  // Regex key check.
+  keyCompatible({a: 1}, {a: /^foo+/}, ['foo'], true);
+  keyCompatible({a: 1}, {a: /^foo+/}, ['foooo'], true);
+  keyCompatible({a: 1}, {a: /^foo+/}, ['foooobar'], true);
+  keyCompatible({a: 1}, {a: /^foo+/}, ['afoooo'], false);
+  keyCompatible({a: 1}, {a: /^foo+/}, [''], false);
+  keyCompatible({a: 1}, {a: {$regex: "^foo+"}}, ['foo'], true);
+  keyCompatible({a: 1}, {a: {$regex: "^foo+"}}, ['foooo'], true);
+  keyCompatible({a: 1}, {a: {$regex: "^foo+"}}, ['foooobar'], true);
+  keyCompatible({a: 1}, {a: {$regex: "^foo+"}}, ['afoooo'], false);
+  keyCompatible({a: 1}, {a: {$regex: "^foo+"}}, [''], false);
+
+  keyCompatible({a: 1}, {a: /^foo+/i}, ['foo'], true);
+  // Key compatibility check appears to be turned off for regexps with flags.
+  keyCompatible({a: 1}, {a: /^foo+/i}, ['bar'], true);
+  keyCompatible({a: 1}, {a: /^foo+/m}, ['bar'], true);
+  keyCompatible({a: 1}, {a: {$regex: "^foo+", $options: "i"}}, ['bar'], true);
+  keyCompatible({a: 1}, {a: {$regex: "^foo+", $options: "m"}}, ['bar'], true);
+
+  // Multiple keys!
+  keyCompatible({a: 1, b: 1, c: 1},
+                {a: {$gt: 5}, c: {$lt: 3}}, [6, "bla", 2], true);
+  keyCompatible({a: 1, b: 1, c: 1},
+                {a: {$gt: 5}, c: {$lt: 3}}, [6, "bla", 4], false);
+  keyCompatible({a: 1, b: 1, c: 1},
+                {a: {$gt: 5}, c: {$lt: 3}}, [3, "bla", 1], false);
+  // No filtering is done (ie, all keys are compatible) if the first key isn't
+  // constrained.
+  keyCompatible({a: 1, b: 1, c: 1},
+                {c: {$lt: 3}}, [3, "bla", 4], true);
+});
+
+Tinytest.add("minimongo - sort function", function (test) {
+  var c = new LocalCollection();
+
+  c.insert({a: 1});
+  c.insert({a: 10});
+  c.insert({a: 5});
+  c.insert({a: 7});
+  c.insert({a: 2});
+  c.insert({a: 4});
+  c.insert({a: 3});
+
+  var sortFunction = function (doc1, doc2) {
+    return doc2.a - doc1.a;
+  };
+
+  test.equal(c.find({}, {sort: sortFunction}).fetch(), c.find({}).fetch().sort(sortFunction));
+  test.notEqual(c.find({}).fetch(), c.find({}).fetch().sort(sortFunction));
+  test.equal(c.find({}, {sort: {a: -1}}).fetch(), c.find({}).fetch().sort(sortFunction));
+});
+
+Tinytest.add("minimongo - binary search", function (test) {
+  var forwardCmp = function (a, b) {
+    return a - b;
+  };
+
+  var backwardCmp = function (a, b) {
+    return -1 * forwardCmp(a, b);
+  };
+
+  var checkSearch = function (cmp, array, value, expected, message) {
+    var actual = LocalCollection._binarySearch(cmp, array, value);
+    if (expected != actual) {
+      test.fail({type: "minimongo-binary-search",
+                 message: message + " : Expected index " + expected +
+                 " but had " + actual
+      });
+    }
+  };
+
+  var checkSearchForward = function (array, value, expected, message) {
+    checkSearch(forwardCmp, array, value, expected, message);
+  };
+  var checkSearchBackward = function (array, value, expected, message) {
+    checkSearch(backwardCmp, array, value, expected, message);
+  };
+
+  checkSearchForward([1, 2, 5, 7], 4, 2, "Inner insert");
+  checkSearchForward([1, 2, 3, 4], 3, 3, "Inner insert, equal value");
+  checkSearchForward([1, 2, 5], 4, 2, "Inner insert, odd length");
+  checkSearchForward([1, 3, 5, 6], 9, 4, "End insert");
+  checkSearchForward([1, 3, 5, 6], 0, 0, "Beginning insert");
+  checkSearchForward([1], 0, 0, "Single array, less than.");
+  checkSearchForward([1], 1, 1, "Single array, equal.");
+  checkSearchForward([1], 2, 1, "Single array, greater than.");
+  checkSearchForward([], 1, 0, "Empty array");
+  checkSearchForward([1, 1, 1, 2, 2, 2, 2], 1, 3, "Highly degenerate array, lower");
+  checkSearchForward([1, 1, 1, 2, 2, 2, 2], 2, 7, "Highly degenerate array, upper");
+  checkSearchForward([2, 2, 2, 2, 2, 2, 2], 1, 0, "Highly degenerate array, lower");
+  checkSearchForward([2, 2, 2, 2, 2, 2, 2], 2, 7, "Highly degenerate array, equal");
+  checkSearchForward([2, 2, 2, 2, 2, 2, 2], 3, 7, "Highly degenerate array, upper");
+
+  checkSearchBackward([7, 5, 2, 1], 4, 2, "Backward: Inner insert");
+  checkSearchBackward([4, 3, 2, 1], 3, 2, "Backward: Inner insert, equal value");
+  checkSearchBackward([5, 2, 1], 4, 1, "Backward: Inner insert, odd length");
+  checkSearchBackward([6, 5, 3, 1], 9, 0, "Backward: Beginning insert");
+  checkSearchBackward([6, 5, 3, 1], 0, 4, "Backward: End insert");
+  checkSearchBackward([1], 0, 1, "Backward: Single array, less than.");
+  checkSearchBackward([1], 1, 1, "Backward: Single array, equal.");
+  checkSearchBackward([1], 2, 0, "Backward: Single array, greater than.");
+  checkSearchBackward([], 1, 0, "Backward: Empty array");
+  checkSearchBackward([2, 2, 2, 2, 1, 1, 1], 1, 7, "Backward: Degenerate array, lower");
+  checkSearchBackward([2, 2, 2, 2, 1, 1, 1], 2, 4, "Backward: Degenerate array, upper");
+  checkSearchBackward([2, 2, 2, 2, 2, 2, 2], 1, 7, "Backward: Highly degenerate array, upper");
+  checkSearchBackward([2, 2, 2, 2, 2, 2, 2], 2, 7, "Backward: Highly degenerate array, upper");
+  checkSearchBackward([2, 2, 2, 2, 2, 2, 2], 3, 0, "Backward: Highly degenerate array, upper");
+});
+
+Tinytest.add("minimongo - modify", function (test) {
+  var modifyWithQuery = function (doc, query, mod, expected) {
+    var coll = new LocalCollection;
+    coll.insert(doc);
+    // The query is relevant for 'a.$.b'.
+    coll.update(query, mod);
+    var actual = coll.findOne();
+    delete actual._id;  // added by insert
+    test.equal(actual, expected, EJSON.stringify({input: doc, mod: mod}));
+  };
+  var modify = function (doc, mod, expected) {
+    modifyWithQuery(doc, {}, mod, expected);
+  };
+  var exceptionWithQuery = function (doc, query, mod) {
+    var coll = new LocalCollection;
+    coll.insert(doc);
+    test.throws(function () {
+      coll.update(query, mod);
+    });
+  };
+  var exception = function (doc, mod) {
+    exceptionWithQuery(doc, {}, mod);
+  };
+
+  // document replacement
+  modify({}, {}, {});
+  modify({a: 12}, {}, {}); // tested against mongodb
+  modify({a: 12}, {a: 13}, {a:13});
+  modify({a: 12, b: 99}, {a: 13}, {a:13});
+  exception({a: 12}, {a: 13, $set: {b: 13}});
+  exception({a: 12}, {$set: {b: 13}, a: 13});
+
+  // keys
+  modify({}, {$set: {'a': 12}}, {a: 12});
+  modify({}, {$set: {'a.b': 12}}, {a: {b: 12}});
+  modify({}, {$set: {'a.b.c': 12}}, {a: {b: {c: 12}}});
+  modify({a: {d: 99}}, {$set: {'a.b.c': 12}}, {a: {d: 99, b: {c: 12}}});
+  modify({}, {$set: {'a.b.3.c': 12}}, {a: {b: {3: {c: 12}}}});
+  modify({a: {b: []}}, {$set: {'a.b.3.c': 12}}, {
+    a: {b: [null, null, null, {c: 12}]}});
+  exception({a: [null, null, null]}, {$set: {'a.1.b': 12}});
+  exception({a: [null, 1, null]}, {$set: {'a.1.b': 12}});
+  exception({a: [null, "x", null]}, {$set: {'a.1.b': 12}});
+  exception({a: [null, [], null]}, {$set: {'a.1.b': 12}});
+  modify({a: [null, null, null]}, {$set: {'a.3.b': 12}}, {
+    a: [null, null, null, {b: 12}]});
+  exception({a: []}, {$set: {'a.b': 12}});
+  exception({a: 12}, {$set: {'a.b': 99}}); // tested on mongo
+  exception({a: 'x'}, {$set: {'a.b': 99}});
+  exception({a: true}, {$set: {'a.b': 99}});
+  exception({a: null}, {$set: {'a.b': 99}});
+  modify({a: {}}, {$set: {'a.3': 12}}, {a: {'3': 12}});
+  modify({a: []}, {$set: {'a.3': 12}}, {a: [null, null, null, 12]});
+  exception({}, {$set: {'': 12}}); // tested on mongo
+  exception({}, {$set: {'.': 12}}); // tested on mongo
+  exception({}, {$set: {'a.': 12}}); // tested on mongo
+  exception({}, {$set: {'. ': 12}}); // tested on mongo
+  exception({}, {$inc: {'... ': 12}}); // tested on mongo
+  exception({}, {$set: {'a..b': 12}}); // tested on mongo
+  modify({a: [1,2,3]}, {$set: {'a.01': 99}}, {a: [1, 99, 3]});
+  modify({a: [1,{a: 98},3]}, {$set: {'a.01.b': 99}}, {a: [1,{a:98, b: 99},3]});
+  modify({}, {$set: {'2.a.b': 12}}, {'2': {'a': {'b': 12}}}); // tested
+  exception({x: []}, {$set: {'x.2..a': 99}});
+  modify({x: [null, null]}, {$set: {'x.2.a': 1}}, {x: [null, null, {a: 1}]});
+  exception({x: [null, null]}, {$set: {'x.1.a': 1}});
+
+  // a.$.b
+  modifyWithQuery({a: [{x: 2}, {x: 4}]}, {'a.x': 4}, {$set: {'a.$.z': 9}},
+                  {a: [{x: 2}, {x: 4, z: 9}]});
+  exception({a: [{x: 2}, {x: 4}]}, {$set: {'a.$.z': 9}});
+  exceptionWithQuery({a: [{x: 2}, {x: 4}], b: 5}, {b: 5}, {$set: {'a.$.z': 9}});
+  // can't have two $
+  exceptionWithQuery({a: [{x: [2]}]}, {'a.x': 2}, {$set: {'a.$.x.$': 9}});
+  modifyWithQuery({a: [5, 6, 7]}, {a: 6}, {$set: {'a.$': 9}}, {a: [5, 9, 7]});
+  modifyWithQuery({a: [{b: [{c: 9}, {c: 10}]}, {b: {c: 11}}]}, {'a.b.c': 10},
+                  {$unset: {'a.$.b': 1}}, {a: [{}, {b: {c: 11}}]});
+  modifyWithQuery({a: [{b: [{c: 9}, {c: 10}]}, {b: {c: 11}}]}, {'a.b.c': 11},
+                  {$unset: {'a.$.b': 1}},
+                  {a: [{b: [{c: 9}, {c: 10}]}, {}]});
+  modifyWithQuery({a: [1]}, {'a.0': 1}, {$set: {'a.$': 5}}, {a: [5]});
+  modifyWithQuery({a: [9]}, {a: {$mod: [2, 1]}}, {$set: {'a.$': 5}}, {a: [5]});
+  // Negatives don't set '$'.
+  exceptionWithQuery({a: [1]}, {$not: {a: 2}}, {$set: {'a.$': 5}});
+  exceptionWithQuery({a: [1]}, {'a.0': {$ne: 2}}, {$set: {'a.$': 5}});
+  // One $or clause works.
+  modifyWithQuery({a: [{x: 2}, {x: 4}]},
+                  {$or: [{'a.x': 4}]}, {$set: {'a.$.z': 9}},
+                  {a: [{x: 2}, {x: 4, z: 9}]});
+  // More $or clauses throw.
+  exceptionWithQuery({a: [{x: 2}, {x: 4}]},
+                     {$or: [{'a.x': 4}, {'a.x': 4}]},
+                     {$set: {'a.$.z': 9}});
+  // $and uses the last one.
+  modifyWithQuery({a: [{x: 1}, {x: 3}]},
+                  {$and: [{'a.x': 1}, {'a.x': 3}]},
+                  {$set: {'a.$.x': 5}},
+                  {a: [{x: 1}, {x: 5}]});
+  modifyWithQuery({a: [{x: 1}, {x: 3}]},
+                  {$and: [{'a.x': 3}, {'a.x': 1}]},
+                  {$set: {'a.$.x': 5}},
+                  {a: [{x: 5}, {x: 3}]});
+  // Same goes for the implicit AND of a document selector.
+  modifyWithQuery({a: [{x: 1}, {y: 3}]},
+                  {'a.x': 1, 'a.y': 3},
+                  {$set: {'a.$.z': 5}},
+                  {a: [{x: 1}, {y: 3, z: 5}]});
+  // with $near, make sure it finds the closest one
+  modifyWithQuery({a: [{b: [1,1]},
+                       {b: [ [3,3], [4,4] ]},
+                       {b: [9,9]}]},
+                  {'a.b': {$near: [5, 5]}},
+                  {$set: {'a.$.b': 'k'}},
+                  {a: [{b: [1,1]}, {b: 'k'}, {b: [9,9]}]});
+  modifyWithQuery({a: [{x: 1}, {y: 1}, {x: 1, y: 1}]},
+                  {a: {$elemMatch: {x: 1, y: 1}}},
+                  {$set: {'a.$.x': 2}},
+                  {a: [{x: 1}, {y: 1}, {x: 2, y: 1}]});
+  modifyWithQuery({a: [{b: [{x: 1}, {y: 1}, {x: 1, y: 1}]}]},
+                  {'a.b': {$elemMatch: {x: 1, y: 1}}},
+                  {$set: {'a.$.b': 3}},
+                  {a: [{b: 3}]});
+
+  // $inc
+  modify({a: 1, b: 2}, {$inc: {a: 10}}, {a: 11, b: 2});
+  modify({a: 1, b: 2}, {$inc: {c: 10}}, {a: 1, b: 2, c: 10});
+  exception({a: 1}, {$inc: {a: '10'}});
+  exception({a: 1}, {$inc: {a: true}});
+  exception({a: 1}, {$inc: {a: [10]}});
+  exception({a: '1'}, {$inc: {a: 10}});
+  exception({a: [1]}, {$inc: {a: 10}});
+  exception({a: {}}, {$inc: {a: 10}});
+  exception({a: false}, {$inc: {a: 10}});
+  exception({a: null}, {$inc: {a: 10}});
+  modify({a: [1, 2]}, {$inc: {'a.1': 10}}, {a: [1, 12]});
+  modify({a: [1, 2]}, {$inc: {'a.2': 10}}, {a: [1, 2, 10]});
+  modify({a: [1, 2]}, {$inc: {'a.3': 10}}, {a: [1, 2, null, 10]});
+  modify({a: {b: 2}}, {$inc: {'a.b': 10}}, {a: {b: 12}});
+  modify({a: {b: 2}}, {$inc: {'a.c': 10}}, {a: {b: 2, c: 10}});
+  exception({}, {$inc: {_id: 1}});
+
+  // $set
+  modify({a: 1, b: 2}, {$set: {a: 10}}, {a: 10, b: 2});
+  modify({a: 1, b: 2}, {$set: {c: 10}}, {a: 1, b: 2, c: 10});
+  modify({a: 1, b: 2}, {$set: {a: {c: 10}}}, {a: {c: 10}, b: 2});
+  modify({a: [1, 2], b: 2}, {$set: {a: [3, 4]}}, {a: [3, 4], b: 2});
+  modify({a: [1, 2, 3], b: 2}, {$set: {'a.1': [3, 4]}},
+         {a: [1, [3, 4], 3], b:2});
+  modify({a: [1], b: 2}, {$set: {'a.1': 9}}, {a: [1, 9], b: 2});
+  modify({a: [1], b: 2}, {$set: {'a.2': 9}}, {a: [1, null, 9], b: 2});
+  modify({a: {b: 1}}, {$set: {'a.c': 9}}, {a: {b: 1, c: 9}});
+  modify({}, {$set: {'x._id': 4}}, {x: {_id: 4}});
+  exception({}, {$set: {_id: 4}});
+  exception({_id: 4}, {$set: {_id: 4}});  // even not-changing _id is bad
+
+  // $unset
+  modify({}, {$unset: {a: 1}}, {});
+  modify({a: 1}, {$unset: {a: 1}}, {});
+  modify({a: 1, b: 2}, {$unset: {a: 1}}, {b: 2});
+  modify({a: 1, b: 2}, {$unset: {a: 0}}, {b: 2});
+  modify({a: 1, b: 2}, {$unset: {a: false}}, {b: 2});
+  modify({a: 1, b: 2}, {$unset: {a: null}}, {b: 2});
+  modify({a: 1, b: 2}, {$unset: {a: [1]}}, {b: 2});
+  modify({a: 1, b: 2}, {$unset: {a: {}}}, {b: 2});
+  modify({a: {b: 2, c: 3}}, {$unset: {'a.b': 1}}, {a: {c: 3}});
+  modify({a: [1, 2, 3]}, {$unset: {'a.1': 1}}, {a: [1, null, 3]}); // tested
+  modify({a: [1, 2, 3]}, {$unset: {'a.2': 1}}, {a: [1, 2, null]}); // tested
+  modify({a: [1, 2, 3]}, {$unset: {'a.x': 1}}, {a: [1, 2, 3]}); // tested
+  modify({a: {b: 1}}, {$unset: {'a.b.c.d': 1}}, {a: {b: 1}});
+  modify({a: {b: 1}}, {$unset: {'a.x.c.d': 1}}, {a: {b: 1}});
+  modify({a: {b: {c: 1}}}, {$unset: {'a.b.c': 1}}, {a: {b: {}}});
+  exception({}, {$unset: {_id: 1}});
+
+  // $push
+  modify({}, {$push: {a: 1}}, {a: [1]});
+  modify({a: []}, {$push: {a: 1}}, {a: [1]});
+  modify({a: [1]}, {$push: {a: 2}}, {a: [1, 2]});
+  exception({a: true}, {$push: {a: 1}});
+  modify({a: [1]}, {$push: {a: [2]}}, {a: [1, [2]]});
+  modify({a: []}, {$push: {'a.1': 99}}, {a: [null, [99]]}); // tested
+  modify({a: {}}, {$push: {'a.x': 99}}, {a: {x: [99]}});
+  modify({}, {$push: {a: {$each: [1, 2, 3]}}},
+         {a: [1, 2, 3]});
+  modify({a: []}, {$push: {a: {$each: [1, 2, 3]}}},
+         {a: [1, 2, 3]});
+  modify({a: [true]}, {$push: {a: {$each: [1, 2, 3]}}},
+         {a: [true, 1, 2, 3]});
+  // No positive numbers for $slice
+  exception({}, {$push: {a: {$each: [], $slice: 5}}});
+  modify({a: [true]}, {$push: {a: {$each: [1, 2, 3], $slice: -2}}},
+         {a: [2, 3]});
+  modify({a: [false, true]}, {$push: {a: {$each: [1], $slice: -2}}},
+         {a: [true, 1]});
+  modify(
+    {a: [{x: 3}, {x: 1}]},
+    {$push: {a: {
+      $each: [{x: 4}, {x: 2}],
+      $slice: -2,
+      $sort: {x: 1}
+    }}},
+    {a: [{x: 3}, {x: 4}]});
+  modify({}, {$push: {a: {$each: [1, 2, 3], $slice: 0}}}, {a: []});
+  modify({a: [1, 2]}, {$push: {a: {$each: [1, 2, 3], $slice: 0}}}, {a: []});
+  // $push with $position modifier
+  // No negative number for $position
+  exception({a: []}, {$push: {a: {$each: [0], $position: -1}}});
+  modify({a: [1, 2]}, {$push: {a: {$each: [0], $position: 0}}},
+    {a: [0, 1, 2]});
+  modify({a: [1, 2]}, {$push: {a: {$each: [-1, 0], $position: 0}}},
+    {a: [-1, 0, 1, 2]});
+  modify({a: [1, 3]}, {$push: {a: {$each: [2], $position: 1}}}, {a: [1, 2, 3]});
+  modify({a: [1, 4]}, {$push: {a: {$each: [2, 3], $position: 1}}},
+    {a: [1, 2, 3, 4]});
+  modify({a: [1, 2]}, {$push: {a: {$each: [3], $position: 3}}}, {a: [1, 2, 3]});
+  modify({a: [1, 2]}, {$push: {a: {$each: [3], $position: 99}}},
+    {a: [1, 2, 3]});
+  modify({a: [1, 2]}, {$push: {a: {$each: [3], $position: 99, $slice: -2}}},
+    {a: [2, 3]});
+  modify(
+    {a: [{x: 1}, {x: 2}]},
+    {$push: {a: {$each: [{x: 3}], $position: 0, $sort: {x: 1}, $slice: -3}}},
+    {a: [{x: 1}, {x: 2}, {x: 3}]}
+  );
+  modify(
+    {a: [{x: 1}, {x: 2}]},
+    {$push: {a: {$each: [{x: 3}], $position: 0, $sort: {x: 1}, $slice: 0}}},
+    {a: []}
+  );
+
+
+  // $pushAll
+  modify({}, {$pushAll: {a: [1]}}, {a: [1]});
+  modify({a: []}, {$pushAll: {a: [1]}}, {a: [1]});
+  modify({a: [1]}, {$pushAll: {a: [2]}}, {a: [1, 2]});
+  modify({}, {$pushAll: {a: [1, 2]}}, {a: [1, 2]});
+  modify({a: []}, {$pushAll: {a: [1, 2]}}, {a: [1, 2]});
+  modify({a: [1]}, {$pushAll: {a: [2, 3]}}, {a: [1, 2, 3]});
+  modify({}, {$pushAll: {a: []}}, {a: []});
+  modify({a: []}, {$pushAll: {a: []}}, {a: []});
+  modify({a: [1]}, {$pushAll: {a: []}}, {a: [1]});
+  exception({a: true}, {$pushAll: {a: [1]}});
+  exception({a: []}, {$pushAll: {a: 1}});
+  modify({a: []}, {$pushAll: {'a.1': [99]}}, {a: [null, [99]]});
+  modify({a: []}, {$pushAll: {'a.1': []}}, {a: [null, []]});
+  modify({a: {}}, {$pushAll: {'a.x': [99]}}, {a: {x: [99]}});
+  modify({a: {}}, {$pushAll: {'a.x': []}}, {a: {x: []}});
+
+  // $addToSet
+  modify({}, {$addToSet: {a: 1}}, {a: [1]});
+  modify({a: []}, {$addToSet: {a: 1}}, {a: [1]});
+  modify({a: [1]}, {$addToSet: {a: 2}}, {a: [1, 2]});
+  modify({a: [1, 2]}, {$addToSet: {a: 1}}, {a: [1, 2]});
+  modify({a: [1, 2]}, {$addToSet: {a: 2}}, {a: [1, 2]});
+  modify({a: [1, 2]}, {$addToSet: {a: 3}}, {a: [1, 2, 3]});
+  exception({a: true}, {$addToSet: {a: 1}});
+  modify({a: [1]}, {$addToSet: {a: [2]}}, {a: [1, [2]]});
+  modify({}, {$addToSet: {a: {x: 1}}}, {a: [{x: 1}]});
+  modify({a: [{x: 1}]}, {$addToSet: {a: {x: 1}}}, {a: [{x: 1}]});
+  modify({a: [{x: 1}]}, {$addToSet: {a: {x: 2}}}, {a: [{x: 1}, {x: 2}]});
+  modify({a: [{x: 1, y: 2}]}, {$addToSet: {a: {x: 1, y: 2}}},
+         {a: [{x: 1, y: 2}]});
+  modify({a: [{x: 1, y: 2}]}, {$addToSet: {a: {y: 2, x: 1}}},
+         {a: [{x: 1, y: 2}, {y: 2, x: 1}]});
+  modify({a: [1, 2]}, {$addToSet: {a: {$each: [3, 1, 4]}}}, {a: [1, 2, 3, 4]});
+  modify({a: [1, 2]}, {$addToSet: {a: {$each: [3, 1, 4], b: 12}}},
+         {a: [1, 2, 3, 4]}); // tested
+  modify({a: [1, 2]}, {$addToSet: {a: {b: 12, $each: [3, 1, 4]}}},
+         {a: [1, 2, {b: 12, $each: [3, 1, 4]}]}); // tested
+  modify({}, {$addToSet: {a: {$each: []}}}, {a: []});
+  modify({}, {$addToSet: {a: {$each: [1]}}}, {a: [1]});
+  modify({a: []}, {$addToSet: {'a.1': 99}}, {a: [null, [99]]});
+  modify({a: {}}, {$addToSet: {'a.x': 99}}, {a: {x: [99]}});
+
+  // $pop
+  modify({}, {$pop: {a: 1}}, {}); // tested
+  modify({}, {$pop: {a: -1}}, {}); // tested
+  modify({a: []}, {$pop: {a: 1}}, {a: []});
+  modify({a: []}, {$pop: {a: -1}}, {a: []});
+  modify({a: [1, 2, 3]}, {$pop: {a: 1}}, {a: [1, 2]});
+  modify({a: [1, 2, 3]}, {$pop: {a: 10}}, {a: [1, 2]});
+  modify({a: [1, 2, 3]}, {$pop: {a: .001}}, {a: [1, 2]});
+  modify({a: [1, 2, 3]}, {$pop: {a: 0}}, {a: [1, 2]});
+  modify({a: [1, 2, 3]}, {$pop: {a: "stuff"}}, {a: [1, 2]});
+  modify({a: [1, 2, 3]}, {$pop: {a: -1}}, {a: [2, 3]});
+  modify({a: [1, 2, 3]}, {$pop: {a: -10}}, {a: [2, 3]});
+  modify({a: [1, 2, 3]}, {$pop: {a: -.001}}, {a: [2, 3]});
+  exception({a: true}, {$pop: {a: 1}});
+  exception({a: true}, {$pop: {a: -1}});
+  modify({a: []}, {$pop: {'a.1': 1}}, {a: []}); // tested
+  modify({a: [1, [2, 3], 4]}, {$pop: {'a.1': 1}}, {a: [1, [2], 4]});
+  modify({a: {}}, {$pop: {'a.x': 1}}, {a: {}}); // tested
+  modify({a: {x: [2, 3]}}, {$pop: {'a.x': 1}}, {a: {x: [2]}});
+
+  // $pull
+  modify({}, {$pull: {a: 1}}, {});
+  modify({}, {$pull: {'a.x': 1}}, {});
+  modify({a: {}}, {$pull: {'a.x': 1}}, {a: {}});
+  exception({a: true}, {$pull: {a: 1}});
+  modify({a: [2, 1, 2]}, {$pull: {a: 1}}, {a: [2, 2]});
+  modify({a: [2, 1, 2]}, {$pull: {a: 2}}, {a: [1]});
+  modify({a: [2, 1, 2]}, {$pull: {a: 3}}, {a: [2, 1, 2]});
+  modify({a: [1, null, 2, null]}, {$pull: {a: null}}, {a: [1, 2]});
+  modify({a: []}, {$pull: {a: 3}}, {a: []});
+  modify({a: [[2], [2, 1], [3]]}, {$pull: {a: [2, 1]}},
+         {a: [[2], [3]]}); // tested
+  modify({a: [{b: 1, c: 2}, {b: 2, c: 2}]}, {$pull: {a: {b: 1}}},
+         {a: [{b: 2, c: 2}]});
+  modify({a: [{b: 1, c: 2}, {b: 2, c: 2}]}, {$pull: {a: {c: 2}}},
+         {a: []});
+  // XXX implement this functionality!
+  // probably same refactoring as $elemMatch?
+  // modify({a: [1, 2, 3, 4]}, {$pull: {$gt: 2}}, {a: [1,2]}); fails!
+
+  // $pullAll
+  modify({}, {$pullAll: {a: [1]}}, {});
+  modify({a: [1, 2, 3]}, {$pullAll: {a: []}}, {a: [1, 2, 3]});
+  modify({a: [1, 2, 3]}, {$pullAll: {a: [2]}}, {a: [1, 3]});
+  modify({a: [1, 2, 3]}, {$pullAll: {a: [2, 1]}}, {a: [3]});
+  modify({a: [1, 2, 3]}, {$pullAll: {a: [1, 2]}}, {a: [3]});
+  modify({}, {$pullAll: {'a.b.c': [2]}}, {});
+  exception({a: true}, {$pullAll: {a: [1]}});
+  exception({a: [1, 2, 3]}, {$pullAll: {a: 1}});
+  modify({x: [{a: 1}, {a: 1, b: 2}]}, {$pullAll: {x: [{a: 1}]}},
+         {x: [{a: 1, b: 2}]});
+
+  // $rename
+  modify({}, {$rename: {a: 'b'}}, {});
+  modify({a: [12]}, {$rename: {a: 'b'}}, {b: [12]});
+  modify({a: {b: 12}}, {$rename: {a: 'c'}}, {c: {b: 12}});
+  modify({a: {b: 12}}, {$rename: {'a.b': 'a.c'}}, {a: {c: 12}});
+  modify({a: {b: 12}}, {$rename: {'a.b': 'x'}}, {a: {}, x: 12}); // tested
+  modify({a: {b: 12}}, {$rename: {'a.b': 'q.r'}}, {a: {}, q: {r: 12}});
+  modify({a: {b: 12}}, {$rename: {'a.b': 'q.2.r'}}, {a: {}, q: {2: {r: 12}}});
+  modify({a: {b: 12}, q: {}}, {$rename: {'a.b': 'q.2.r'}},
+         {a: {}, q: {2: {r: 12}}});
+  exception({a: {b: 12}, q: []}, {$rename: {'a.b': 'q.2'}}); // tested
+  exception({a: {b: 12}, q: []}, {$rename: {'a.b': 'q.2.r'}}); // tested
+  // These strange MongoDB behaviors throw.
+  // modify({a: {b: 12}, q: []}, {$rename: {'q.1': 'x'}},
+  //        {a: {b: 12}, x: []}); // tested
+  // modify({a: {b: 12}, q: []}, {$rename: {'q.1.j': 'x'}},
+  //        {a: {b: 12}, x: []}); // tested
+  exception({}, {$rename: {'a': 'a'}});
+  exception({}, {$rename: {'a.b': 'a.b'}});
+  modify({a: 12, b: 13}, {$rename: {a: 'b'}}, {b: 12});
+
+  // $bit
+  // unimplemented
+
+  // XXX test case sensitivity of modops
+  // XXX for each (most) modop, test that it performs a deep copy
+});
+
+// XXX test update() (selecting docs, multi, upsert..)
+
+Tinytest.add("minimongo - observe ordered", function (test) {
+  var operations = [];
+  var cbs = log_callbacks(operations);
+  var handle;
+
+  var c = new LocalCollection();
+  handle = c.find({}, {sort: {a: 1}}).observe(cbs);
+  test.isTrue(handle.collection === c);
+
+  c.insert({_id: 'foo', a:1});
+  test.equal(operations.shift(), ['added', {a:1}, 0, null]);
+  c.update({a:1}, {$set: {a: 2}});
+  test.equal(operations.shift(), ['changed', {a:2}, 0, {a:1}]);
+  c.insert({a:10});
+  test.equal(operations.shift(), ['added', {a:10}, 1, null]);
+  c.update({}, {$inc: {a: 1}}, {multi: true});
+  test.equal(operations.shift(), ['changed', {a:3}, 0, {a:2}]);
+  test.equal(operations.shift(), ['changed', {a:11}, 1, {a:10}]);
+  c.update({a:11}, {a:1});
+  test.equal(operations.shift(), ['changed', {a:1}, 1, {a:11}]);
+  test.equal(operations.shift(), ['moved', {a:1}, 1, 0, 'foo']);
+  c.remove({a:2});
+  test.equal(operations.shift(), undefined);
+  c.remove({a:3});
+  test.equal(operations.shift(), ['removed', 'foo', 1, {a:3}]);
+
+  // test stop
+  handle.stop();
+  var idA2 = Random.id();
+  c.insert({_id: idA2, a:2});
+  test.equal(operations.shift(), undefined);
+
+  // test initial inserts (and backwards sort)
+  handle = c.find({}, {sort: {a: -1}}).observe(cbs);
+  test.equal(operations.shift(), ['added', {a:2}, 0, null]);
+  test.equal(operations.shift(), ['added', {a:1}, 1, null]);
+  handle.stop();
+
+  // test _suppress_initial
+  handle = c.find({}, {sort: {a: -1}}).observe(_.extend({
+    _suppress_initial: true}, cbs));
+  test.equal(operations.shift(), undefined);
+  c.insert({a:100});
+  test.equal(operations.shift(), ['added', {a:100}, 0, idA2]);
+  handle.stop();
+
+  // test skip and limit.
+  c.remove({});
+  handle = c.find({}, {sort: {a: 1}, skip: 1, limit: 2}).observe(cbs);
+  test.equal(operations.shift(), undefined);
+  c.insert({a:1});
+  test.equal(operations.shift(), undefined);
+  c.insert({_id: 'foo', a:2});
+  test.equal(operations.shift(), ['added', {a:2}, 0, null]);
+  c.insert({a:3});
+  test.equal(operations.shift(), ['added', {a:3}, 1, null]);
+  c.insert({a:4});
+  test.equal(operations.shift(), undefined);
+  c.update({a:1}, {a:0});
+  test.equal(operations.shift(), undefined);
+  c.update({a:0}, {a:5});
+  test.equal(operations.shift(), ['removed', 'foo', 0, {a:2}]);
+  test.equal(operations.shift(), ['added', {a:4}, 1, null]);
+  c.update({a:3}, {a:3.5});
+  test.equal(operations.shift(), ['changed', {a:3.5}, 0, {a:3}]);
+  handle.stop();
+
+  // test observe limit with pre-existing docs
+  c.remove({});
+  c.insert({a: 1});
+  c.insert({_id: 'two', a: 2});
+  c.insert({a: 3});
+  handle = c.find({}, {sort: {a: 1}, limit: 2}).observe(cbs);
+  test.equal(operations.shift(), ['added', {a:1}, 0, null]);
+  test.equal(operations.shift(), ['added', {a:2}, 1, null]);
+  test.equal(operations.shift(), undefined);
+  c.remove({a: 2});
+  test.equal(operations.shift(), ['removed', 'two', 1, {a:2}]);
+  test.equal(operations.shift(), ['added', {a:3}, 1, null]);
+  test.equal(operations.shift(), undefined);
+  handle.stop();
+
+  // test _no_indices
+
+  c.remove({});
+  handle = c.find({}, {sort: {a: 1}}).observe(_.extend(cbs, {_no_indices: true}));
+  c.insert({_id: 'foo', a:1});
+  test.equal(operations.shift(), ['added', {a:1}, -1, null]);
+  c.update({a:1}, {$set: {a: 2}});
+  test.equal(operations.shift(), ['changed', {a:2}, -1, {a:1}]);
+  c.insert({a:10});
+  test.equal(operations.shift(), ['added', {a:10}, -1, null]);
+  c.update({}, {$inc: {a: 1}}, {multi: true});
+  test.equal(operations.shift(), ['changed', {a:3}, -1, {a:2}]);
+  test.equal(operations.shift(), ['changed', {a:11}, -1, {a:10}]);
+  c.update({a:11}, {a:1});
+  test.equal(operations.shift(), ['changed', {a:1}, -1, {a:11}]);
+  test.equal(operations.shift(), ['moved', {a:1}, -1, -1, 'foo']);
+  c.remove({a:2});
+  test.equal(operations.shift(), undefined);
+  c.remove({a:3});
+  test.equal(operations.shift(), ['removed', 'foo', -1, {a:3}]);
+  handle.stop();
+});
+
+_.each([true, false], function (ordered) {
+  Tinytest.add("minimongo - observe ordered: " + ordered, function (test) {
+    var c = new LocalCollection();
+
+    var ev = "";
+    var makecb = function (tag) {
+      var ret = {};
+      _.each(["added", "changed", "removed"], function (fn) {
+        var fnName = ordered ? fn + "At" : fn;
+        ret[fnName] = function (doc) {
+          ev = (ev + fn.substr(0, 1) + tag + doc._id + "_");
+        };
+      });
+      return ret;
+    };
+    var expect = function (x) {
+      test.equal(ev, x);
+      ev = "";
+    };
+
+    c.insert({_id: 1, name: "strawberry", tags: ["fruit", "red", "squishy"]});
+    c.insert({_id: 2, name: "apple", tags: ["fruit", "red", "hard"]});
+    c.insert({_id: 3, name: "rose", tags: ["flower", "red", "squishy"]});
+
+    // This should work equally well for ordered and unordered observations
+    // (because the callbacks don't look at indices and there's no 'moved'
+    // callback).
+    var handle = c.find({tags: "flower"}).observe(makecb('a'));
+    expect("aa3_");
+    c.update({name: "rose"}, {$set: {tags: ["bloom", "red", "squishy"]}});
+    expect("ra3_");
+    c.update({name: "rose"}, {$set: {tags: ["flower", "red", "squishy"]}});
+    expect("aa3_");
+    c.update({name: "rose"}, {$set: {food: false}});
+    expect("ca3_");
+    c.remove({});
+    expect("ra3_");
+    c.insert({_id: 4, name: "daisy", tags: ["flower"]});
+    expect("aa4_");
+    handle.stop();
+    // After calling stop, no more callbacks are called.
+    c.insert({_id: 5, name: "iris", tags: ["flower"]});
+    expect("");
+
+    // Test that observing a lookup by ID works.
+    handle = c.find(4).observe(makecb('b'));
+    expect('ab4_');
+    c.update(4, {$set: {eek: 5}});
+    expect('cb4_');
+    handle.stop();
+
+    // Test observe with reactive: false.
+    handle = c.find({tags: "flower"}, {reactive: false}).observe(makecb('c'));
+    expect('ac4_ac5_');
+    // This insert shouldn't trigger a callback because it's not reactive.
+    c.insert({_id: 6, name: "river", tags: ["flower"]});
+    expect('');
+    handle.stop();
+  });
+});
+
+
+Tinytest.add("minimongo - saveOriginals", function (test) {
+  // set up some data
+  var c = new LocalCollection(),
+      count;
+  c.insert({_id: 'foo', x: 'untouched'});
+  c.insert({_id: 'bar', x: 'updateme'});
+  c.insert({_id: 'baz', x: 'updateme'});
+  c.insert({_id: 'quux', y: 'removeme'});
+  c.insert({_id: 'whoa', y: 'removeme'});
+
+  // Save originals and make some changes.
+  c.saveOriginals();
+  c.insert({_id: "hooray", z: 'insertme'});
+  c.remove({y: 'removeme'});
+  count = c.update({x: 'updateme'}, {$set: {z: 5}}, {multi: true});
+  c.update('bar', {$set: {k: 7}});  // update same doc twice
+
+  // Verify returned count is correct
+  test.equal(count, 2);
+
+  // Verify the originals.
+  var originals = c.retrieveOriginals();
+  var affected = ['bar', 'baz', 'quux', 'whoa', 'hooray'];
+  test.equal(originals.size(), _.size(affected));
+  _.each(affected, function (id) {
+    test.isTrue(originals.has(id));
+  });
+  test.equal(originals.get('bar'), {_id: 'bar', x: 'updateme'});
+  test.equal(originals.get('baz'), {_id: 'baz', x: 'updateme'});
+  test.equal(originals.get('quux'), {_id: 'quux', y: 'removeme'});
+  test.equal(originals.get('whoa'), {_id: 'whoa', y: 'removeme'});
+  test.equal(originals.get('hooray'), undefined);
+
+  // Verify that changes actually occured.
+  test.equal(c.find().count(), 4);
+  test.equal(c.findOne('foo'), {_id: 'foo', x: 'untouched'});
+  test.equal(c.findOne('bar'), {_id: 'bar', x: 'updateme', z: 5, k: 7});
+  test.equal(c.findOne('baz'), {_id: 'baz', x: 'updateme', z: 5});
+  test.equal(c.findOne('hooray'), {_id: 'hooray', z: 'insertme'});
+
+  // The next call doesn't get the same originals again.
+  c.saveOriginals();
+  originals = c.retrieveOriginals();
+  test.isTrue(originals);
+  test.isTrue(originals.empty());
+
+  // Insert and remove a document during the period.
+  c.saveOriginals();
+  c.insert({_id: 'temp', q: 8});
+  c.remove('temp');
+  originals = c.retrieveOriginals();
+  test.equal(originals.size(), 1);
+  test.isTrue(originals.has('temp'));
+  test.equal(originals.get('temp'), undefined);
+});
+
+Tinytest.add("minimongo - saveOriginals errors", function (test) {
+  var c = new LocalCollection();
+  // Can't call retrieve before save.
+  test.throws(function () { c.retrieveOriginals(); });
+  c.saveOriginals();
+  // Can't call save twice.
+  test.throws(function () { c.saveOriginals(); });
+});
+
+Tinytest.add("minimongo - objectid transformation", function (test) {
+  var testId = function (item) {
+    test.equal(item, MongoID.idParse(MongoID.idStringify(item)));
+  };
+  var randomOid = new MongoID.ObjectID();
+  testId(randomOid);
+  testId("FOO");
+  testId("ffffffffffff");
+  testId("0987654321abcdef09876543");
+  testId(new MongoID.ObjectID());
+  testId("--a string");
+
+  test.equal("ffffffffffff", MongoID.idParse(MongoID.idStringify("ffffffffffff")));
+});
+
+
+Tinytest.add("minimongo - objectid", function (test) {
+  var randomOid = new MongoID.ObjectID();
+  var anotherRandomOid = new MongoID.ObjectID();
+  test.notEqual(randomOid, anotherRandomOid);
+  test.throws(function() { new MongoID.ObjectID("qqqqqqqqqqqqqqqqqqqqqqqq");});
+  test.throws(function() { new MongoID.ObjectID("ABCDEF"); });
+  test.equal(randomOid, new MongoID.ObjectID(randomOid.valueOf()));
+});
+
+Tinytest.add("minimongo - pause", function (test) {
+  var operations = [];
+  var cbs = log_callbacks(operations);
+
+  var c = new LocalCollection();
+  var h = c.find({}).observe(cbs);
+
+  // remove and add cancel out.
+  c.insert({_id: 1, a: 1});
+  test.equal(operations.shift(), ['added', {a:1}, 0, null]);
+
+  c.pauseObservers();
+
+  c.remove({_id: 1});
+  test.length(operations, 0);
+  c.insert({_id: 1, a: 1});
+  test.length(operations, 0);
+
+  c.resumeObservers();
+  test.length(operations, 0);
+
+
+  // two modifications become one
+  c.pauseObservers();
+
+  c.update({_id: 1}, {a: 2});
+  c.update({_id: 1}, {a: 3});
+
+  c.resumeObservers();
+  test.equal(operations.shift(), ['changed', {a:3}, 0, {a:1}]);
+  test.length(operations, 0);
+
+  // test special case for remove({})
+  c.pauseObservers();
+  test.equal(c.remove({}), 1);
+  test.length(operations, 0);
+  c.resumeObservers();
+  test.equal(operations.shift(), ['removed', 1, 0, {a:3}]);
+  test.length(operations, 0);
+
+  h.stop();
+});
+
+Tinytest.add("minimongo - ids matched by selector", function (test) {
+  var check = function (selector, ids) {
+    var idsFromSelector = LocalCollection._idsMatchedBySelector(selector);
+    // XXX normalize order, in a way that also works for ObjectIDs?
+    test.equal(idsFromSelector, ids);
+  };
+  check("foo", ["foo"]);
+  check({_id: "foo"}, ["foo"]);
+  var oid1 = new MongoID.ObjectID();
+  check(oid1, [oid1]);
+  check({_id: oid1}, [oid1]);
+  check({_id: "foo", x: 42}, ["foo"]);
+  check({}, null);
+  check({_id: {$in: ["foo", oid1]}}, ["foo", oid1]);
+  check({_id: {$ne: "foo"}}, null);
+  // not actually valid, but works for now...
+  check({$and: ["foo"]}, ["foo"]);
+  check({$and: [{x: 42}, {_id: oid1}]}, [oid1]);
+  check({$and: [{x: 42}, {_id: {$in: [oid1]}}]}, [oid1]);
+});
+
+Tinytest.add("minimongo - reactive stop", function (test) {
+  var coll = new LocalCollection();
+  coll.insert({_id: 'A'});
+  coll.insert({_id: 'B'});
+  coll.insert({_id: 'C'});
+
+  var addBefore = function (str, newChar, before) {
+    var idx = str.indexOf(before);
+    if (idx === -1)
+      return str + newChar;
+    return str.slice(0, idx) + newChar + str.slice(idx);
+  };
+
+  var x, y;
+  var sortOrder = ReactiveVar(1);
+
+  var c = Tracker.autorun(function () {
+    var q = coll.find({}, {sort: {_id: sortOrder.get()}});
+    x = "";
+    q.observe({ addedAt: function (doc, atIndex, before) {
+      x = addBefore(x, doc._id, before);
+    }});
+    y = "";
+    q.observeChanges({ addedBefore: function (id, fields, before) {
+      y = addBefore(y, id, before);
+    }});
+  });
+
+  test.equal(x, "ABC");
+  test.equal(y, "ABC");
+
+  sortOrder.set(-1);
+  test.equal(x, "ABC");
+  test.equal(y, "ABC");
+  Tracker.flush();
+  test.equal(x, "CBA");
+  test.equal(y, "CBA");
+
+  coll.insert({_id: 'D'});
+  coll.insert({_id: 'E'});
+  test.equal(x, "EDCBA");
+  test.equal(y, "EDCBA");
+
+  c.stop();
+  // stopping kills the observes immediately
+  coll.insert({_id: 'F'});
+  test.equal(x, "EDCBA");
+  test.equal(y, "EDCBA");
+});
+
+Tinytest.add("minimongo - immediate invalidate", function (test) {
+  var coll = new LocalCollection();
+  coll.insert({_id: 'A'});
+
+  // This has two separate findOnes.  findOne() uses skip/limit, which means
+  // that its response to an update() call involves a recompute. We used to have
+  // a bug where we would first calculate all the calls that need to be
+  // recomputed, then recompute them one by one, without checking to see if the
+  // callbacks from recomputing one query stopped the second query, which
+  // crashed.
+  var c = Tracker.autorun(function () {
+    coll.findOne('A');
+    coll.findOne('A');
+  });
+
+  coll.update('A', {$set: {x: 42}});
+
+  c.stop();
+});
+
+
+Tinytest.add("minimongo - count on cursor with limit", function(test){
+  var coll = new LocalCollection(), count;
+
+  coll.insert({_id: 'A'});
+  coll.insert({_id: 'B'});
+  coll.insert({_id: 'C'});
+  coll.insert({_id: 'D'});
+
+  var c = Tracker.autorun(function (c) {
+    var cursor = coll.find({_id: {$exists: true}}, {sort: {_id: 1}, limit: 3});
+    count = cursor.count();
+  });
+
+  test.equal(count, 3);
+
+  coll.remove('A'); // still 3 in the collection
+  Tracker.flush();
+  test.equal(count, 3);
+
+  coll.remove('B'); // expect count now 2
+  Tracker.flush();
+  test.equal(count, 2);
+
+
+  coll.insert({_id: 'A'}); // now 3 again
+  Tracker.flush();
+  test.equal(count, 3);
+
+  coll.insert({_id: 'B'}); // now 4 entries, but count should be 3 still
+  Tracker.flush();
+  test.equal(count, 3);
+
+  c.stop();
+});
+
+Tinytest.add("minimongo - reactive count with cached cursor", function (test) {
+  var coll = new LocalCollection;
+  var cursor = coll.find({});
+  var firstAutorunCount, secondAutorunCount;
+  Tracker.autorun(function(){
+    firstAutorunCount = cursor.count();
+  });
+  Tracker.autorun(function(){
+    secondAutorunCount = coll.find({}).count();
+  });
+  test.equal(firstAutorunCount, 0);
+  test.equal(secondAutorunCount, 0);
+  coll.insert({i: 1});
+  coll.insert({i: 2});
+  coll.insert({i: 3});
+  Tracker.flush();
+  test.equal(firstAutorunCount, 3);
+  test.equal(secondAutorunCount, 3);
+});
+
+Tinytest.add("minimongo - $near operator tests", function (test) {
+  var coll = new LocalCollection();
+  coll.insert({ rest: { loc: [2, 3] } });
+  coll.insert({ rest: { loc: [-3, 3] } });
+  coll.insert({ rest: { loc: [5, 5] } });
+
+  test.equal(coll.find({ 'rest.loc': { $near: [0, 0], $maxDistance: 30 } }).count(), 3);
+  test.equal(coll.find({ 'rest.loc': { $near: [0, 0], $maxDistance: 4 } }).count(), 1);
+  var points = coll.find({ 'rest.loc': { $near: [0, 0], $maxDistance: 6 } }).fetch();
+  _.each(points, function (point, i, points) {
+    test.isTrue(!i || distance([0, 0], point.rest.loc) >= distance([0, 0], points[i - 1].rest.loc));
+  });
+
+  function distance(a, b) {
+    var x = a[0] - b[0];
+    var y = a[1] - b[1];
+    return Math.sqrt(x * x + y * y);
+  }
+
+  // GeoJSON tests
+  coll = new LocalCollection();
+  var data = [{ "category" : "BURGLARY", "descript" : "BURGLARY OF STORE, FORCIBLE ENTRY", "address" : "100 Block of 10TH ST", "location" : { "type" : "Point", "coordinates" : [  -122.415449723856,  37.7749518087273 ] } },
+    { "category" : "WEAPON LAWS", "descript" : "POSS OF PROHIBITED WEAPON", "address" : "900 Block of MINNA ST", "location" : { "type" : "Point", "coordinates" : [  -122.415386041221,  37.7747879744156 ] } },
+    { "category" : "LARCENY/THEFT", "descript" : "GRAND THEFT OF PROPERTY", "address" : "900 Block of MINNA ST", "location" : { "type" : "Point", "coordinates" : [  -122.41538270191,  37.774683628213 ] } },
+    { "category" : "LARCENY/THEFT", "descript" : "PETTY THEFT FROM LOCKED AUTO", "address" : "900 Block of MINNA ST", "location" : { "type" : "Point", "coordinates" : [  -122.415396041221,  37.7747879744156 ] } },
+    { "category" : "OTHER OFFENSES", "descript" : "POSSESSION OF BURGLARY TOOLS", "address" : "900 Block of MINNA ST", "location" : { "type" : "Point", "coordinates" : [  -122.415386041221,  37.7747879734156 ] } }
+  ];
+
+  _.each(data, function (x, i) { coll.insert(_.extend(x, { x: i })); });
+
+  var close15 = coll.find({ location: { $near: {
+    $geometry: { type: "Point",
+                 coordinates: [-122.4154282, 37.7746115] },
+    $maxDistance: 15 } } }).fetch();
+  test.length(close15, 1);
+  test.equal(close15[0].descript, "GRAND THEFT OF PROPERTY");
+
+  var close20 = coll.find({ location: { $near: {
+    $geometry: { type: "Point",
+                 coordinates: [-122.4154282, 37.7746115] },
+    $maxDistance: 20 } } }).fetch();
+  test.length(close20, 4);
+  test.equal(close20[0].descript, "GRAND THEFT OF PROPERTY");
+  test.equal(close20[1].descript, "PETTY THEFT FROM LOCKED AUTO");
+  test.equal(close20[2].descript, "POSSESSION OF BURGLARY TOOLS");
+  test.equal(close20[3].descript, "POSS OF PROHIBITED WEAPON");
+
+  // Any combinations of $near with $or/$and/$nor/$not should throw an error
+  test.throws(function () {
+    coll.find({ location: {
+      $not: {
+        $near: {
+          $geometry: {
+            type: "Point",
+            coordinates: [-122.4154282, 37.7746115]
+          }, $maxDistance: 20 } } } });
+  });
+  test.throws(function () {
+    coll.find({
+      $and: [ { location: { $near: { $geometry: { type: "Point", coordinates: [-122.4154282, 37.7746115] }, $maxDistance: 20 }}},
+              { x: 0 }]
+    });
+  });
+  test.throws(function () {
+    coll.find({
+      $or: [ { location: { $near: { $geometry: { type: "Point", coordinates: [-122.4154282, 37.7746115] }, $maxDistance: 20 }}},
+             { x: 0 }]
+    });
+  });
+  test.throws(function () {
+    coll.find({
+      $nor: [ { location: { $near: { $geometry: { type: "Point", coordinates: [-122.4154282, 37.7746115] }, $maxDistance: 1 }}},
+              { x: 0 }]
+    });
+  });
+  test.throws(function () {
+    coll.find({
+      $and: [{
+        $and: [{
+          location: {
+            $near: {
+              $geometry: {
+                type: "Point",
+                coordinates: [-122.4154282, 37.7746115]
+              },
+              $maxDistance: 1
+            }
+          }
+        }]
+      }]
+    });
+  });
+
+  // array tests
+  coll = new LocalCollection();
+  coll.insert({
+    _id: "x",
+    k: 9,
+    a: [
+      {b: [
+        [100, 100],
+        [1,  1]]},
+      {b: [150,  150]}]});
+  coll.insert({
+    _id: "y",
+    k: 9,
+    a: {b: [5, 5]}});
+  var testNear = function (near, md, expected) {
+    test.equal(
+      _.pluck(
+        coll.find({'a.b': {$near: near, $maxDistance: md}}).fetch(), '_id'),
+      expected);
+  };
+  testNear([149, 149], 4, ['x']);
+  testNear([149, 149], 1000, ['x', 'y']);
+  // It's important that we figure out that 'x' is closer than 'y' to [2,2] even
+  // though the first within-1000 point in 'x' (ie, [100,100]) is farther than
+  // 'y'.
+  testNear([2, 2], 1000, ['x', 'y']);
+
+  // Ensure that distance is used as a tie-breaker for sort.
+  test.equal(
+    _.pluck(coll.find({'a.b': {$near: [1, 1]}}, {sort: {k: 1}}).fetch(), '_id'),
+    ['x', 'y']);
+  test.equal(
+    _.pluck(coll.find({'a.b': {$near: [5, 5]}}, {sort: {k: 1}}).fetch(), '_id'),
+    ['y', 'x']);
+
+  var operations = [];
+  var cbs = log_callbacks(operations);
+  var handle = coll.find({'a.b': {$near: [7,7]}}).observe(cbs);
+
+  test.length(operations, 2);
+  test.equal(operations.shift(), ['added', {k:9, a:{b:[5,5]}}, 0, null]);
+  test.equal(operations.shift(),
+             ['added', {k: 9, a:[{b:[[100,100],[1,1]]},{b:[150,150]}]},
+              1, null]);
+  // This needs to be inserted in the MIDDLE of the two existing ones.
+  coll.insert({a: {b: [3,3]}});
+  test.length(operations, 1);
+  test.equal(operations.shift(), ['added', {a: {b: [3, 3]}}, 1, 'x']);
+
+  handle.stop();
+});
+
+// Regression test for #4377. Previously, "replace" updates didn't clone the
+// argument.
+Tinytest.add("minimongo - update should clone", function (test) {
+  var x = [];
+  var coll = new LocalCollection;
+  var id = coll.insert({});
+  coll.update(id, {x: x});
+  x.push(1);
+  test.equal(coll.findOne(id), {_id: id, x: []});
+});
+
+// See #2275.
+Tinytest.add("minimongo - fetch in observe", function (test) {
+  var coll = new LocalCollection;
+  var callbackInvoked = false;
+  var observe = coll.find().observeChanges({
+    added: function (id, fields) {
+      callbackInvoked = true;
+      test.equal(fields, {foo: 1});
+      var doc = coll.findOne({foo: 1});
+      test.isTrue(doc);
+      test.equal(doc.foo, 1);
+    }
+  });
+  test.isFalse(callbackInvoked);
+  var computation = Tracker.autorun(function (computation) {
+    if (computation.firstRun) {
+      coll.insert({foo: 1});
+    }
+  });
+  test.isTrue(callbackInvoked);
+  observe.stop();
+  computation.stop();
+});
+
+// See #2254
+Tinytest.add("minimongo - fine-grained reactivity of observe with fields projection", function (test) {
+  var X = new LocalCollection;
+  var id = "asdf";
+  X.insert({_id: id, foo: {bar: 123}});
+
+  var callbackInvoked = false;
+  var obs = X.find(id, {fields: {'foo.bar': 1}}).observeChanges({
+    changed: function (id, fields) {
+      callbackInvoked = true;
+    }
+  });
+
+  test.isFalse(callbackInvoked);
+  X.update(id, {$set: {'foo.baz': 456}});
+  test.isFalse(callbackInvoked);
+
+  obs.stop();
+});
+Tinytest.add("minimongo - fine-grained reactivity of query with fields projection", function (test) {
+  var X = new LocalCollection;
+  var id = "asdf";
+  X.insert({_id: id, foo: {bar: 123}});
+
+  var callbackInvoked = false;
+  var computation = Tracker.autorun(function () {
+    callbackInvoked = true;
+    return X.findOne(id, { fields: { 'foo.bar': 1 } });
+  });
+  test.isTrue(callbackInvoked);
+  callbackInvoked = false;
+  X.update(id, {$set: {'foo.baz': 456}});
+  test.isFalse(callbackInvoked);
+  X.update(id, {$set: {'foo.bar': 124}});
+  Tracker.flush();
+  test.isTrue(callbackInvoked);
+
+  computation.stop();
+});
+
+// Tests that the logic in `LocalCollection.prototype.update`
+// correctly deals with count() on a cursor with skip or limit (since
+// then the result set is an IdMap, not an array)
+Tinytest.add("minimongo - reactive skip/limit count while updating", function(test) {
+  var X = new LocalCollection;
+  var count = -1;
+
+  var c = Tracker.autorun(function() {
+    count = X.find({}, {skip: 1, limit: 1}).count();
+  });
+
+  test.equal(count, 0);
+
+  X.insert({});
+  Tracker.flush({_throwFirstError: true});
+  test.equal(count, 0);
+
+  X.insert({});
+  Tracker.flush({_throwFirstError: true});
+  test.equal(count, 1);
+
+  X.update({}, {$set: {foo: 1}});
+  Tracker.flush({_throwFirstError: true});
+  test.equal(count, 1);
+
+  // Make sure a second update also works
+  X.update({}, {$set: {foo: 2}});
+  Tracker.flush({_throwFirstError: true});
+  test.equal(count, 1);
+
+  c.stop();
+});
+
+},{}],22:[function(require,module,exports){
+Tinytest.add("minimongo - wrapTransform", function (test) {
+  var wrap = LocalCollection.wrapTransform;
+
+  // Transforming no function gives falsey.
+  test.isFalse(wrap(undefined));
+  test.isFalse(wrap(null));
+
+  // It's OK if you don't change the ID.
+  var validTransform = function (doc) {
+    delete doc.x;
+    doc.y = 42;
+    doc.z = function () { return 43; };
+    return doc;
+  };
+  var transformed = wrap(validTransform)({_id: "asdf", x: 54});
+  test.equal(_.keys(transformed), ['_id', 'y', 'z']);
+  test.equal(transformed.y, 42);
+  test.equal(transformed.z(), 43);
+
+  // Ensure that ObjectIDs work (even if the _ids in question are not ===-equal)
+  var oid1 = new MongoID.ObjectID();
+  var oid2 = new MongoID.ObjectID(oid1.toHexString());
+  test.equal(wrap(function () {return {_id: oid2};})({_id: oid1}),
+             {_id: oid2});
+
+  // transform functions must return objects
+  var invalidObjects = [
+    "asdf", new MongoID.ObjectID(), false, null, true,
+    27, [123], /adsf/, new Date, function () {}, undefined
+  ];
+  _.each(invalidObjects, function (invalidObject) {
+    var wrapped = wrap(function () { return invalidObject; });
+    test.throws(function () {
+      wrapped({_id: "asdf"});
+    });
+  }, /transform must return object/);
+
+  // transform functions may not change _ids
+  var wrapped = wrap(function (doc) { doc._id = 'x'; return doc; });
+  test.throws(function () {
+    wrapped({_id: 'y'});
+  }, /can't have different _id/);
+
+  // transform functions may remove _ids
+  test.equal({_id: 'a', x: 2},
+             wrap(function (d) {delete d._id; return d;})({_id: 'a', x: 2}));
+
+  // test that wrapped transform functions are nonreactive
+  var unwrapped = function (doc) {
+    test.isFalse(Tracker.active);
+    return doc;
+  };
+  var handle = Tracker.autorun(function () {
+    test.isTrue(Tracker.active);
+    wrap(unwrapped)({_id: "xxx"});
+  });
+  handle.stop();
+});
+
+},{}],23:[function(require,module,exports){
+// options.connection, if given, is a LivedataClient or LivedataServer
+// XXX presently there is no way to destroy/clean up a Collection
+
+/**
+ * @summary Namespace for MongoDB-related items
+ * @namespace
+ */
+Mongo = {};
+
+/**
+ * @summary Constructor for a Collection
+ * @locus Anywhere
+ * @instancename collection
+ * @class
+ * @param {String} name The name of the collection.  If null, creates an unmanaged (unsynchronized) local collection.
+ * @param {Object} [options]
+ * @param {Object} options.connection The server connection that will manage this collection. Uses the default connection if not specified.  Pass the return value of calling [`DDP.connect`](#ddp_connect) to specify a different server. Pass `null` to specify no connection. Unmanaged (`name` is null) collections cannot specify a connection.
+ * @param {String} options.idGeneration The method of generating the `_id` fields of new documents in this collection.  Possible values:
+
+ - **`'STRING'`**: random strings
+ - **`'MONGO'`**:  random [`Mongo.ObjectID`](#mongo_object_id) values
+
+The default id generation technique is `'STRING'`.
+ * @param {Function} options.transform An optional transformation function. Documents will be passed through this function before being returned from `fetch` or `findOne`, and before being passed to callbacks of `observe`, `map`, `forEach`, `allow`, and `deny`. Transforms are *not* applied for the callbacks of `observeChanges` or to cursors returned from publish functions.
+ */
+Mongo.Collection = function (name, options) {
+  var self = this;
+  if (! (self instanceof Mongo.Collection))
+    throw new Error('use "new" to construct a Mongo.Collection');
+
+  if (!name && (name !== null)) {
+    Meteor._debug("Warning: creating anonymous collection. It will not be " +
+                  "saved or synchronized over the network. (Pass null for " +
+                  "the collection name to turn off this warning.)");
+    name = null;
+  }
+
+  if (name !== null && typeof name !== "string") {
+    throw new Error(
+      "First argument to new Mongo.Collection must be a string or null");
+  }
+
+  if (options && options.methods) {
+    // Backwards compatibility hack with original signature (which passed
+    // "connection" directly instead of in options. (Connections must have a "methods"
+    // method.)
+    // XXX remove before 1.0
+    options = {connection: options};
+  }
+  // Backwards compatibility: "connection" used to be called "manager".
+  if (options && options.manager && !options.connection) {
+    options.connection = options.manager;
+  }
+  options = _.extend({
+    connection: undefined,
+    idGeneration: 'STRING',
+    transform: null,
+    _driver: undefined,
+    _preventAutopublish: false
+  }, options);
+
+  switch (options.idGeneration) {
+  case 'MONGO':
+    self._makeNewID = function () {
+      var src = name
+            ? DDP.randomStream('/collection/' + name)
+            : Random.insecure;
+      return new Mongo.ObjectID(src.hexString(24));
+    };
+    break;
+  case 'STRING':
+  default:
+    self._makeNewID = function () {
+      var src = name
+            ? DDP.randomStream('/collection/' + name)
+            : Random.insecure;
+      return src.id();
+    };
+    break;
+  }
+
+  self._transform = LocalCollection.wrapTransform(options.transform);
+
+  if (! name || options.connection === null)
+    // note: nameless collections never have a connection
+    self._connection = null;
+  else if (options.connection)
+    self._connection = options.connection;
+  else if (Meteor.isClient)
+    self._connection = Meteor.connection;
+  else
+    self._connection = Meteor.server;
+
+  if (!options._driver) {
+    // XXX This check assumes that webapp is loaded so that Meteor.server !==
+    // null. We should fully support the case of "want to use a Mongo-backed
+    // collection from Node code without webapp", but we don't yet.
+    // #MeteorServerNull
+    if (name && self._connection === Meteor.server &&
+        typeof MongoInternals !== "undefined" &&
+        MongoInternals.defaultRemoteCollectionDriver) {
+      options._driver = MongoInternals.defaultRemoteCollectionDriver();
+    } else {
+      options._driver = LocalCollectionDriver;
+    }
+  }
+
+  self._collection = options._driver.open(name, self._connection);
+  self._name = name;
+  self._driver = options._driver;
+
+  if (self._connection && self._connection.registerStore) {
+    // OK, we're going to be a slave, replicating some remote
+    // database, except possibly with some temporary divergence while
+    // we have unacknowledged RPC's.
+    var ok = self._connection.registerStore(name, {
+      // Called at the beginning of a batch of updates. batchSize is the number
+      // of update calls to expect.
+      //
+      // XXX This interface is pretty janky. reset probably ought to go back to
+      // being its own function, and callers shouldn't have to calculate
+      // batchSize. The optimization of not calling pause/remove should be
+      // delayed until later: the first call to update() should buffer its
+      // message, and then we can either directly apply it at endUpdate time if
+      // it was the only update, or do pauseObservers/apply/apply at the next
+      // update() if there's another one.
+      beginUpdate: function (batchSize, reset) {
+        // pause observers so users don't see flicker when updating several
+        // objects at once (including the post-reconnect reset-and-reapply
+        // stage), and so that a re-sorting of a query can take advantage of the
+        // full _diffQuery moved calculation instead of applying change one at a
+        // time.
+        if (batchSize > 1 || reset)
+          self._collection.pauseObservers();
+
+        if (reset)
+          self._collection.remove({});
+      },
+
+      // Apply an update.
+      // XXX better specify this interface (not in terms of a wire message)?
+      update: function (msg) {
+        var mongoId = MongoID.idParse(msg.id);
+        var doc = self._collection.findOne(mongoId);
+
+        // Is this a "replace the whole doc" message coming from the quiescence
+        // of method writes to an object? (Note that 'undefined' is a valid
+        // value meaning "remove it".)
+        if (msg.msg === 'replace') {
+          var replace = msg.replace;
+          if (!replace) {
+            if (doc)
+              self._collection.remove(mongoId);
+          } else if (!doc) {
+            self._collection.insert(replace);
+          } else {
+            // XXX check that replace has no $ ops
+            self._collection.update(mongoId, replace);
+          }
+          return;
+        } else if (msg.msg === 'added') {
+          if (doc) {
+            throw new Error("Expected not to find a document already present for an add");
+          }
+          self._collection.insert(_.extend({_id: mongoId}, msg.fields));
+        } else if (msg.msg === 'removed') {
+          if (!doc)
+            throw new Error("Expected to find a document already present for removed");
+          self._collection.remove(mongoId);
+        } else if (msg.msg === 'changed') {
+          if (!doc)
+            throw new Error("Expected to find a document to change");
+          if (!_.isEmpty(msg.fields)) {
+            var modifier = {};
+            _.each(msg.fields, function (value, key) {
+              if (value === undefined) {
+                if (!modifier.$unset)
+                  modifier.$unset = {};
+                modifier.$unset[key] = 1;
+              } else {
+                if (!modifier.$set)
+                  modifier.$set = {};
+                modifier.$set[key] = value;
+              }
+            });
+            self._collection.update(mongoId, modifier);
+          }
+        } else {
+          throw new Error("I don't know how to deal with this message");
+        }
+
+      },
+
+      // Called at the end of a batch of updates.
+      endUpdate: function () {
+        self._collection.resumeObservers();
+      },
+
+      // Called around method stub invocations to capture the original versions
+      // of modified documents.
+      saveOriginals: function () {
+        self._collection.saveOriginals();
+      },
+      retrieveOriginals: function () {
+        return self._collection.retrieveOriginals();
+      },
+
+      // Used to preserve current versions of documents across a store reset.
+      getDoc: function(id) {
+        return self.findOne(id);
+      },
+      
+      // To be able to get back to the collection from the store.
+      _getCollection: function () {
+        return self;
+      }
+    });
+
+    if (!ok)
+      throw new Error("There is already a collection named '" + name + "'");
+  }
+
+  // XXX don't define these until allow or deny is actually used for this
+  // collection. Could be hard if the security rules are only defined on the
+  // server.
+  self._defineMutationMethods();
+
+  // autopublish
+  if (Package.autopublish && !options._preventAutopublish && self._connection
+      && self._connection.publish) {
+    self._connection.publish(null, function () {
+      return self.find();
+    }, {is_auto: true});
+  }
+};
+
+///
+/// Main collection API
+///
+
+
+_.extend(Mongo.Collection.prototype, {
+
+  _getFindSelector: function (args) {
+    if (args.length == 0)
+      return {};
+    else
+      return args[0];
+  },
+
+  _getFindOptions: function (args) {
+    var self = this;
+    if (args.length < 2) {
+      return { transform: self._transform };
+    } else {
+      check(args[1], Match.Optional(Match.ObjectIncluding({
+        fields: Match.Optional(Match.OneOf(Object, undefined)),
+        sort: Match.Optional(Match.OneOf(Object, Array, undefined)),
+        limit: Match.Optional(Match.OneOf(Number, undefined)),
+        skip: Match.Optional(Match.OneOf(Number, undefined))
+     })));
+
+      return _.extend({
+        transform: self._transform
+      }, args[1]);
+    }
+  },
+
+  /**
+   * @summary Find the documents in a collection that match the selector.
+   * @locus Anywhere
+   * @method find
+   * @memberOf Mongo.Collection
+   * @instance
+   * @param {MongoSelector} [selector] A query describing the documents to find
+   * @param {Object} [options]
+   * @param {MongoSortSpecifier} options.sort Sort order (default: natural order)
+   * @param {Number} options.skip Number of results to skip at the beginning
+   * @param {Number} options.limit Maximum number of results to return
+   * @param {MongoFieldSpecifier} options.fields Dictionary of fields to return or exclude.
+   * @param {Boolean} options.reactive (Client only) Default `true`; pass `false` to disable reactivity
+   * @param {Function} options.transform Overrides `transform` on the  [`Collection`](#collections) for this cursor.  Pass `null` to disable transformation.
+   * @param {Boolean} options.disableOplog (Server only) Pass true to disable oplog-tailing on this query. This affects the way server processes calls to `observe` on this query. Disabling the oplog can be useful when working with data that updates in large batches.
+   * @param {Number} options.pollingIntervalMs (Server only) How often to poll this query when observing on the server. In milliseconds. Defaults to 10 seconds.
+   * @param {Number} options.pollingThrottleMs (Server only) Minimum time to allow between re-polling. Increasing this will save CPU and mongo load at the expense of slower updates to users. Decreasing this is not recommended. In milliseconds. Defaults to 50 milliseconds.
+   * @returns {Mongo.Cursor}
+   */
+  find: function (/* selector, options */) {
+    // Collection.find() (return all docs) behaves differently
+    // from Collection.find(undefined) (return 0 docs).  so be
+    // careful about the length of arguments.
+    var self = this;
+    var argArray = _.toArray(arguments);
+    return self._collection.find(self._getFindSelector(argArray),
+                                 self._getFindOptions(argArray));
+  },
+
+  /**
+   * @summary Finds the first document that matches the selector, as ordered by sort and skip options.
+   * @locus Anywhere
+   * @method findOne
+   * @memberOf Mongo.Collection
+   * @instance
+   * @param {MongoSelector} [selector] A query describing the documents to find
+   * @param {Object} [options]
+   * @param {MongoSortSpecifier} options.sort Sort order (default: natural order)
+   * @param {Number} options.skip Number of results to skip at the beginning
+   * @param {MongoFieldSpecifier} options.fields Dictionary of fields to return or exclude.
+   * @param {Boolean} options.reactive (Client only) Default true; pass false to disable reactivity
+   * @param {Function} options.transform Overrides `transform` on the [`Collection`](#collections) for this cursor.  Pass `null` to disable transformation.
+   * @returns {Object}
+   */
+  findOne: function (/* selector, options */) {
+    var self = this;
+    var argArray = _.toArray(arguments);
+    return self._collection.findOne(self._getFindSelector(argArray),
+                                    self._getFindOptions(argArray));
+  }
+
+});
+
+Mongo.Collection._publishCursor = function (cursor, sub, collection) {
+  var observeHandle = cursor.observeChanges({
+    added: function (id, fields) {
+      sub.added(collection, id, fields);
+    },
+    changed: function (id, fields) {
+      sub.changed(collection, id, fields);
+    },
+    removed: function (id) {
+      sub.removed(collection, id);
+    }
+  });
+
+  // We don't call sub.ready() here: it gets called in livedata_server, after
+  // possibly calling _publishCursor on multiple returned cursors.
+
+  // register stop callback (expects lambda w/ no args).
+  sub.onStop(function () {observeHandle.stop();});
+
+  // return the observeHandle in case it needs to be stopped early
+  return observeHandle;
+};
+
+// protect against dangerous selectors.  falsey and {_id: falsey} are both
+// likely programmer error, and not what you want, particularly for destructive
+// operations.  JS regexps don't serialize over DDP but can be trivially
+// replaced by $regex.
+Mongo.Collection._rewriteSelector = function (selector) {
+  // shorthand -- scalars match _id
+  if (LocalCollection._selectorIsId(selector))
+    selector = {_id: selector};
+
+  if (_.isArray(selector)) {
+    // This is consistent with the Mongo console itself; if we don't do this
+    // check passing an empty array ends up selecting all items
+    throw new Error("Mongo selector can't be an array.");
+  }
+
+  if (!selector || (('_id' in selector) && !selector._id))
+    // can't match anything
+    return {_id: Random.id()};
+
+  var ret = {};
+  _.each(selector, function (value, key) {
+    // Mongo supports both {field: /foo/} and {field: {$regex: /foo/}}
+    if (value instanceof RegExp) {
+      ret[key] = convertRegexpToMongoSelector(value);
+    } else if (value && value.$regex instanceof RegExp) {
+      ret[key] = convertRegexpToMongoSelector(value.$regex);
+      // if value is {$regex: /foo/, $options: ...} then $options
+      // override the ones set on $regex.
+      if (value.$options !== undefined)
+        ret[key].$options = value.$options;
+    }
+    else if (_.contains(['$or','$and','$nor'], key)) {
+      // Translate lower levels of $and/$or/$nor
+      ret[key] = _.map(value, function (v) {
+        return Mongo.Collection._rewriteSelector(v);
+      });
+    } else {
+      ret[key] = value;
+    }
+  });
+  return ret;
+};
+
+// convert a JS RegExp object to a Mongo {$regex: ..., $options: ...}
+// selector
+function convertRegexpToMongoSelector(regexp) {
+  check(regexp, RegExp); // safety belt
+
+  var selector = {$regex: regexp.source};
+  var regexOptions = '';
+  // JS RegExp objects support 'i', 'm', and 'g'. Mongo regex $options
+  // support 'i', 'm', 'x', and 's'. So we support 'i' and 'm' here.
+  if (regexp.ignoreCase)
+    regexOptions += 'i';
+  if (regexp.multiline)
+    regexOptions += 'm';
+  if (regexOptions)
+    selector.$options = regexOptions;
+
+  return selector;
+};
+
+// 'insert' immediately returns the inserted document's new _id.
+// The others return values immediately if you are in a stub, an in-memory
+// unmanaged collection, or a mongo-backed collection and you don't pass a
+// callback. 'update' and 'remove' return the number of affected
+// documents. 'upsert' returns an object with keys 'numberAffected' and, if an
+// insert happened, 'insertedId'.
+//
+// Otherwise, the semantics are exactly like other methods: they take
+// a callback as an optional last argument; if no callback is
+// provided, they block until the operation is complete, and throw an
+// exception if it fails; if a callback is provided, then they don't
+// necessarily block, and they call the callback when they finish with error and
+// result arguments.  (The insert method provides the document ID as its result;
+// update and remove provide the number of affected docs as the result; upsert
+// provides an object with numberAffected and maybe insertedId.)
+//
+// On the client, blocking is impossible, so if a callback
+// isn't provided, they just return immediately and any error
+// information is lost.
+//
+// There's one more tweak. On the client, if you don't provide a
+// callback, then if there is an error, a message will be logged with
+// Meteor._debug.
+//
+// The intent (though this is actually determined by the underlying
+// drivers) is that the operations should be done synchronously, not
+// generating their result until the database has acknowledged
+// them. In the future maybe we should provide a flag to turn this
+// off.
+
+/**
+ * @summary Insert a document in the collection.  Returns its unique _id.
+ * @locus Anywhere
+ * @method  insert
+ * @memberOf Mongo.Collection
+ * @instance
+ * @param {Object} doc The document to insert. May not yet have an _id attribute, in which case Meteor will generate one for you.
+ * @param {Function} [callback] Optional.  If present, called with an error object as the first argument and, if no error, the _id as the second.
+ */
+Mongo.Collection.prototype.insert = function insert(doc, callback) {
+  // Make sure we were passed a document to insert
+  if (!doc) {
+    throw new Error("insert requires an argument");
+  }
+
+  // Shallow-copy the document and possibly generate an ID
+  doc = _.extend({}, doc);
+
+  if ('_id' in doc) {
+    if (!doc._id || !(typeof doc._id === 'string'
+          || doc._id instanceof Mongo.ObjectID)) {
+      throw new Error("Meteor requires document _id fields to be non-empty strings or ObjectIDs");
+    }
+  } else {
+    let generateId = true;
+
+    // Don't generate the id if we're the client and the 'outermost' call
+    // This optimization saves us passing both the randomSeed and the id
+    // Passing both is redundant.
+    if (this._isRemoteCollection()) {
+      const enclosing = DDP._CurrentInvocation.get();
+      if (!enclosing) {
+        generateId = false;
+      }
+    }
+
+    if (generateId) {
+      doc._id = this._makeNewID();
+    }
+  }
+
+  // On inserts, always return the id that we generated; on all other
+  // operations, just return the result from the collection.
+  var chooseReturnValueFromCollectionResult = function (result) {
+    if (doc._id) {
+      return doc._id;
+    }
+
+    // XXX what is this for??
+    // It's some iteraction between the callback to _callMutatorMethod and
+    // the return value conversion
+    doc._id = result;
+
+    return result;
+  };
+
+  const wrappedCallback = wrapCallback(
+    callback, chooseReturnValueFromCollectionResult);
+
+  if (this._isRemoteCollection()) {
+    const result = this._callMutatorMethod("insert", [doc], wrappedCallback);
+    return chooseReturnValueFromCollectionResult(result);
+  }
+
+  // it's my collection.  descend into the collection object
+  // and propagate any exception.
+  try {
+    // If the user provided a callback and the collection implements this
+    // operation asynchronously, then queryRet will be undefined, and the
+    // result will be returned through the callback instead.
+    const result = this._collection.insert(doc, wrappedCallback);
+    return chooseReturnValueFromCollectionResult(result);
+  } catch (e) {
+    if (callback) {
+      callback(e);
+      return null;
+    }
+    throw e;
+  }
+}
+
+/**
+ * @summary Modify one or more documents in the collection. Returns the number of affected documents.
+ * @locus Anywhere
+ * @method update
+ * @memberOf Mongo.Collection
+ * @instance
+ * @param {MongoSelector} selector Specifies which documents to modify
+ * @param {MongoModifier} modifier Specifies how to modify the documents
+ * @param {Object} [options]
+ * @param {Boolean} options.multi True to modify all matching documents; false to only modify one of the matching documents (the default).
+ * @param {Boolean} options.upsert True to insert a document if no matching documents are found.
+ * @param {Function} [callback] Optional.  If present, called with an error object as the first argument and, if no error, the number of affected documents as the second.
+ */
+Mongo.Collection.prototype.update = function update(selector, modifier, ...optionsAndCallback) {
+  const callback = popCallbackFromArgs(optionsAndCallback);
+
+  selector = Mongo.Collection._rewriteSelector(selector);
+
+  // We've already popped off the callback, so we are left with an array
+  // of one or zero items
+  const options = _.clone(optionsAndCallback[0]) || {};
+  if (options && options.upsert) {
+    // set `insertedId` if absent.  `insertedId` is a Meteor extension.
+    if (options.insertedId) {
+      if (!(typeof options.insertedId === 'string'
+            || options.insertedId instanceof Mongo.ObjectID))
+        throw new Error("insertedId must be string or ObjectID");
+    } else if (! selector._id) {
+      options.insertedId = this._makeNewID();
+    }
+  }
+
+  const wrappedCallback = wrapCallback(callback);
+
+  if (this._isRemoteCollection()) {
+    const args = [
+      selector,
+      modifier,
+      options
+    ];
+
+    return this._callMutatorMethod("update", args, wrappedCallback);
+  }
+
+  // it's my collection.  descend into the collection object
+  // and propagate any exception.
+  try {
+    // If the user provided a callback and the collection implements this
+    // operation asynchronously, then queryRet will be undefined, and the
+    // result will be returned through the callback instead.
+    return this._collection.update(
+      selector, modifier, options, wrappedCallback);
+  } catch (e) {
+    if (callback) {
+      callback(e);
+      return null;
+    }
+    throw e;
+  }
+}
+
+/**
+ * @summary Remove documents from the collection
+ * @locus Anywhere
+ * @method remove
+ * @memberOf Mongo.Collection
+ * @instance
+ * @param {MongoSelector} selector Specifies which documents to remove
+ * @param {Function} [callback] Optional.  If present, called with an error object as its argument.
+ */
+Mongo.Collection.prototype.remove = function remove(selector, callback) {
+  selector = Mongo.Collection._rewriteSelector(selector);
+
+  const wrappedCallback = wrapCallback(callback);
+
+  if (this._isRemoteCollection()) {
+    return this._callMutatorMethod("remove", [selector], wrappedCallback);
+  }
+
+  // it's my collection.  descend into the collection object
+  // and propagate any exception.
+  try {
+    // If the user provided a callback and the collection implements this
+    // operation asynchronously, then queryRet will be undefined, and the
+    // result will be returned through the callback instead.
+    return this._collection.remove(selector, wrappedCallback);
+  } catch (e) {
+    if (callback) {
+      callback(e);
+      return null;
+    }
+    throw e;
+  }
+};
+
+// Determine if this collection is simply a minimongo representation of a real
+// database on another server
+Mongo.Collection.prototype._isRemoteCollection = function _isRemoteCollection() {
+  // XXX see #MeteorServerNull
+  return this._connection && this._connection !== Meteor.server;
+}
+
+// Convert the callback to not return a result if there is an error
+function wrapCallback(callback, convertResult) {
+  if (!callback) {
+    return;
+  }
+
+  // If no convert function was passed in, just use a "blank function"
+  convertResult = convertResult || _.identity;
+
+  return (error, result) => {
+    callback(error, ! error && convertResult(result));
+  };
+}
+
+/**
+ * @summary Modify one or more documents in the collection, or insert one if no matching documents were found. Returns an object with keys `numberAffected` (the number of documents modified)  and `insertedId` (the unique _id of the document that was inserted, if any).
+ * @locus Anywhere
+ * @param {MongoSelector} selector Specifies which documents to modify
+ * @param {MongoModifier} modifier Specifies how to modify the documents
+ * @param {Object} [options]
+ * @param {Boolean} options.multi True to modify all matching documents; false to only modify one of the matching documents (the default).
+ * @param {Function} [callback] Optional.  If present, called with an error object as the first argument and, if no error, the number of affected documents as the second.
+ */
+Mongo.Collection.prototype.upsert = function upsert(
+    selector, modifier, options, callback) {
+  if (! callback && typeof options === "function") {
+    callback = options;
+    options = {};
+  }
+
+  const updateOptions = _.extend({}, options, {
+    _returnObject: true,
+    upsert: true
+  });
+
+  return this.update(selector, modifier, updateOptions, callback);
+};
+
+// We'll actually design an index API later. For now, we just pass through to
+// Mongo's, but make it synchronous.
+Mongo.Collection.prototype._ensureIndex = function (index, options) {
+  var self = this;
+  if (!self._collection._ensureIndex)
+    throw new Error("Can only call _ensureIndex on server collections");
+  self._collection._ensureIndex(index, options);
+};
+Mongo.Collection.prototype._dropIndex = function (index) {
+  var self = this;
+  if (!self._collection._dropIndex)
+    throw new Error("Can only call _dropIndex on server collections");
+  self._collection._dropIndex(index);
+};
+Mongo.Collection.prototype._dropCollection = function () {
+  var self = this;
+  if (!self._collection.dropCollection)
+    throw new Error("Can only call _dropCollection on server collections");
+  self._collection.dropCollection();
+};
+Mongo.Collection.prototype._createCappedCollection = function (byteSize, maxDocuments) {
+  var self = this;
+  if (!self._collection._createCappedCollection)
+    throw new Error("Can only call _createCappedCollection on server collections");
+  self._collection._createCappedCollection(byteSize, maxDocuments);
+};
+
+/**
+ * @summary Returns the [`Collection`](http://mongodb.github.io/node-mongodb-native/1.4/api-generated/collection.html) object corresponding to this collection from the [npm `mongodb` driver module](https://www.npmjs.com/package/mongodb) which is wrapped by `Mongo.Collection`.
+ * @locus Server
+ */
+Mongo.Collection.prototype.rawCollection = function () {
+  var self = this;
+  if (! self._collection.rawCollection) {
+    throw new Error("Can only call rawCollection on server collections");
+  }
+  return self._collection.rawCollection();
+};
+
+/**
+ * @summary Returns the [`Db`](http://mongodb.github.io/node-mongodb-native/1.4/api-generated/db.html) object corresponding to this collection's database connection from the [npm `mongodb` driver module](https://www.npmjs.com/package/mongodb) which is wrapped by `Mongo.Collection`.
+ * @locus Server
+ */
+Mongo.Collection.prototype.rawDatabase = function () {
+  var self = this;
+  if (! (self._driver.mongo && self._driver.mongo.db)) {
+    throw new Error("Can only call rawDatabase on server collections");
+  }
+  return self._driver.mongo.db;
+};
+
+
+/**
+ * @summary Create a Mongo-style `ObjectID`.  If you don't specify a `hexString`, the `ObjectID` will generated randomly (not using MongoDB's ID construction rules).
+ * @locus Anywhere
+ * @class
+ * @param {String} [hexString] Optional.  The 24-character hexadecimal contents of the ObjectID to create
+ */
+Mongo.ObjectID = MongoID.ObjectID;
+
+/**
+ * @summary To create a cursor, use find. To access the documents in a cursor, use forEach, map, or fetch.
+ * @class
+ * @instanceName cursor
+ */
+Mongo.Cursor = LocalCollection.Cursor;
+
+/**
+ * @deprecated in 0.9.1
+ */
+Mongo.Collection.Cursor = Mongo.Cursor;
+
+/**
+ * @deprecated in 0.9.1
+ */
+Mongo.Collection.ObjectID = Mongo.ObjectID;
+
+/**
+ * @deprecated in 0.9.1
+ */
+Meteor.Collection = Mongo.Collection;
+
+// Allow deny stuff is now in the allow-deny package
+_.extend(Meteor.Collection.prototype, AllowDeny.CollectionPrototype);
+
+function popCallbackFromArgs(args) {
+  // Pull off any callback (or perhaps a 'callback' variable that was passed
+  // in undefined, like how 'upsert' does it).
+  if (args.length &&
+      (args[args.length - 1] === undefined ||
+       args[args.length - 1] instanceof Function)) {
+    return args.pop();
+  }
+}
+
+},{}],24:[function(require,module,exports){
+LocalCollectionDriver = function () {
+  var self = this;
+  self.noConnCollections = {};
+};
+
+var ensureCollection = function (name, collections) {
+  if (!(name in collections))
+    collections[name] = new LocalCollection(name);
+  return collections[name];
+};
+
+_.extend(LocalCollectionDriver.prototype, {
+  open: function (name, conn) {
+    var self = this;
+    if (!name)
+      return new LocalCollection;
+    if (! conn) {
+      return ensureCollection(name, self.noConnCollections);
+    }
+    if (! conn._mongo_livedata_collections)
+      conn._mongo_livedata_collections = {};
+    // XXX is there a way to keep track of a connection's collections without
+    // dangling it off the connection object?
+    return ensureCollection(name, conn._mongo_livedata_collections);
+  }
+});
+
+// singleton
+LocalCollectionDriver = new LocalCollectionDriver;
+
+},{}],25:[function(require,module,exports){
+// Run a function named `run` which modifies a sequence. While it
+// executes, observe changes to the sequence and accumulate them in an
+// array, canonicalizing as necessary. Then make sure the results are
+// the same as passed in `expectedCallbacks`. In items in
+// `expectedCallbacks`, allow for special values of the form {NOT:
+// "foo"}, which match anything other than "foo".
+//
+// @param test {Object} as passed to Tinytest.add
+// @param sequenceFunc {Function(): sequence type}
+// @param run {Function()} modify the sequence or cause sequenceFunc
+//     to be recomupted
+// @param expectedCallbacks {Array}
+//     elements are objects eg {addedAt: [array of arguments]}
+// @param numExpectedWarnings {Number}
+runOneObserveSequenceTestCase = function (test, sequenceFunc,
+                                          run, expectedCallbacks,
+                                          numExpectedWarnings) {
+  if (numExpectedWarnings)
+    ObserveSequence._suppressWarnings += numExpectedWarnings;
+
+  var firedCallbacks = [];
+  var handle = ObserveSequence.observe(sequenceFunc, {
+    addedAt: function () {
+      firedCallbacks.push({addedAt: _.toArray(arguments)});
+    },
+    changedAt: function () {
+      var obj = {changedAt: _.toArray(arguments)};
+
+      // Browsers are inconsistent about the order in which 'changedAt'
+      // callbacks fire. To ensure consistent behavior of these tests,
+      // we can't simply push `obj` at the end of `firedCallbacks` as
+      // we do for the other callbacks. Instead, we use insertion sort
+      // to place `obj` in a canonical position within the chunk of
+      // contiguously recently fired 'changedAt' callbacks.
+      for (var i = firedCallbacks.length; i > 0; i--) {
+
+        var compareTo = firedCallbacks[i - 1];
+        if (!compareTo.changedAt)
+          break;
+
+        if (EJSON.stringify(compareTo, {canonical: true}) <
+            EJSON.stringify(obj, {canonical: true}))
+          break;
+      }
+
+      firedCallbacks.splice(i, 0, obj);
+    },
+    removedAt: function () {
+      firedCallbacks.push({removedAt: _.toArray(arguments)});
+    },
+    movedTo: function () {
+      firedCallbacks.push({movedTo: _.toArray(arguments)});
+    }
+  });
+
+  run();
+  Tracker.flush();
+  handle.stop();
+
+  test.equal(ObserveSequence._suppressWarnings, 0);
+  test.equal(ObserveSequence._loggedWarnings, 0);
+  ObserveSequence._loggedWarnings = 0;
+
+  // any expected argument this is `{NOT: "foo"}`, should match any
+  // corresponding value in the fired callbacks other than "foo". so,
+  // assert non-equality and then replace the appropriate entries in
+  // the 'firedCallbacks' array with `{NOT: "foo"}` before calling
+  // `test.equal` below.
+  var commonLength = Math.min(firedCallbacks.length, expectedCallbacks.length);
+  for (var i = 0; i < commonLength; i++) {
+    var callback = expectedCallbacks[i];
+    if (_.keys(callback).length !== 1)
+      throw new Error("Callbacks should be objects with one key, eg `addedAt`");
+    var callbackName = _.keys(callback)[0];
+    var args = _.values(callback)[0];
+    _.each(args, function (arg, argIndex) {
+      if (arg && typeof arg === 'object' &&
+          'NOT' in arg &&
+          firedCallbacks[i][callbackName]) {
+        test.notEqual(firedCallbacks[i][callbackName][argIndex],
+                      arg.NOT, "Should be NOT " + arg.NOT);
+        firedCallbacks[i][callbackName][argIndex] = arg;
+      }
+    });
+  }
+
+  var compress = function (str) {
+    return str.replace(/\[\n\s*/gm, "[").replace(/\{\n\s*/gm, "{").
+      replace(/\n\s*\]/gm, "]").replace(/\n\s*\}/gm, "}");
+  };
+
+  test.equal(compress(EJSON.stringify(firedCallbacks, {canonical: true, indent: true})),
+             compress(EJSON.stringify(expectedCallbacks, {canonical: true, indent: true})));
+};
+
+Tinytest.add('observe-sequence - initial data for all sequence types', function (test) {
+  runOneObserveSequenceTestCase(test, function () {
+    return null;
+  }, function () {}, []);
+
+  runOneObserveSequenceTestCase(test, function () {
+    return [];
+  }, function () {}, []);
+
+  runOneObserveSequenceTestCase(test, function () {
+    return [{foo: 1}, {bar: 2}];
+  }, function () {}, [
+    {addedAt: [0, {foo: 1}, 0, null]},
+    {addedAt: [1, {bar: 2}, 1, null]}
+  ]);
+
+  runOneObserveSequenceTestCase(test, function () {
+    return [{_id: "13", foo: 1}, {_id: "37", bar: 2}];
+  }, function () {}, [
+    {addedAt: ["13", {_id: "13", foo: 1}, 0, null]},
+    {addedAt: ["37", {_id: "37", bar: 2}, 1, null]}
+  ]);
+
+  runOneObserveSequenceTestCase(test, function () {
+    var coll = new Mongo.Collection(null);
+    coll.insert({_id: "13", foo: 1});
+    coll.insert({_id: "37", bar: 2});
+    var cursor = coll.find({}, {sort: {_id: 1}});
+    return cursor;
+  }, function () {}, [
+    {addedAt: ["13", {_id: "13", foo: 1}, 0, null]},
+    {addedAt: ["37", {_id: "37", bar: 2}, 1, null]}
+  ]);
+
+  // shouldn't break on array with duplicate _id's, and the ids sent
+  // in the callbacks should be distinct
+  runOneObserveSequenceTestCase(test, function () {
+    return [
+      {_id: "13", foo: 1},
+      {_id: "13", foo: 2}
+    ];
+  }, function () {}, [
+    {addedAt: ["13", {_id: "13", foo: 1}, 0, null]},
+    {addedAt: [{NOT: "13"}, {_id: "13", foo: 2}, 1, null]}
+  ], /*numExpectedWarnings = */1);
+});
+
+Tinytest.add('observe-sequence - array to other array', function (test) {
+  var dep = new Tracker.Dependency;
+  var seq = [{_id: "13", foo: 1}, {_id: "37", bar: 2}];
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    seq = [{_id: "13", foo: 1}, {_id: "38", bar: 2}];
+    dep.changed();
+  }, [
+    {addedAt: ["13", {_id: "13", foo: 1}, 0, null]},
+    {addedAt: ["37", {_id: "37", bar: 2}, 1, null]},
+    {removedAt: ["37", {_id: "37", bar: 2}, 1]},
+    {addedAt: ["38", {_id: "38", bar: 2}, 1, null]},
+    {changedAt: ["13", {_id: "13", foo: 1}, {_id: "13", foo: 1}, 0]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - array to other array, strings', function (test) {
+  var dep = new Tracker.Dependency;
+  var seq = ["A", "B"];
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    seq = ["B", "C"];
+    dep.changed();
+  }, [
+    {addedAt: ["-A", "A", 0, null]},
+    {addedAt: ["-B", "B", 1, null]},
+    {removedAt: ["-A", "A", 0]},
+    {addedAt: ["-C", "C", 1, null]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - array to other array, objects without ids', function (test) {
+  var dep = new Tracker.Dependency;
+  var seq = [{foo: 1}, {bar: 2}];
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    seq = [{foo: 2}];
+    dep.changed();
+  }, [
+    {addedAt: [0, {foo: 1}, 0, null]},
+    {addedAt: [1, {bar: 2}, 1, null]},
+    {removedAt: [1, {bar: 2}, 1]},
+    {changedAt: [0, {foo: 2}, {foo: 1}, 0]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - array to other array, changes', function (test) {
+  var dep = new Tracker.Dependency;
+  var seq = [{_id: "13", foo: 1}, {_id: "37", bar: 2}, {_id: "42", baz: 42}];
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    seq = [{_id: "13", foo: 1}, {_id: "38", bar: 2}, {_id: "42", baz: 43}];
+    dep.changed();
+  }, [
+    {addedAt: ["13", {_id: "13", foo: 1}, 0, null]},
+    {addedAt: ["37", {_id: "37", bar: 2}, 1, null]},
+    {addedAt: ["42", {_id: "42", baz: 42}, 2, null]},
+    {removedAt: ["37", {_id: "37", bar: 2}, 1]},
+    {addedAt: ["38", {_id: "38", bar: 2}, 1, "42"]},
+    // change fires for all elements, because we don't diff the actual
+    // objects.
+    {changedAt: ["13", {_id: "13", foo: 1}, {_id: "13", foo: 1}, 0]},
+    {changedAt: ["42", {_id: "42", baz: 43}, {_id: "42", baz: 42}, 2]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - array to other array, movedTo', function (test) {
+  var dep = new Tracker.Dependency;
+  var seq = [{_id: "13", foo: 1}, {_id: "37", bar: 2}, {_id: "42", baz: 42}, {_id: "43", baz: 43}];
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    seq = [{_id: "43", baz: 43}, {_id: "37", bar: 2}, {_id: "42", baz: 42}, {_id: "13", foo: 1}];
+    dep.changed();
+  }, [
+    {addedAt: ["13", {_id: "13", foo: 1}, 0, null]},
+    {addedAt: ["37", {_id: "37", bar: 2}, 1, null]},
+    {addedAt: ["42", {_id: "42", baz: 42}, 2, null]},
+    {addedAt: ["43", {_id: "43", baz: 43}, 3, null]},
+
+    {movedTo: ["43", {_id: "43", baz: 43}, 3, 1, "37"]},
+    {movedTo: ["13", {_id: "13", foo: 1}, 0, 3, null]},
+
+    {changedAt: ["13", {_id: "13", foo: 1}, {_id: "13", foo: 1}, 3]},
+    {changedAt: ["37", {_id: "37", bar: 2}, {_id: "37", bar: 2}, 1]},
+    {changedAt: ["42", {_id: "42", baz: 42}, {_id: "42", baz: 42}, 2]},
+    {changedAt: ["43", {_id: "43", baz: 43}, {_id: "43", baz: 43}, 0]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - array to other array, movedTo the end', function (test) {
+  var dep = new Tracker.Dependency;
+  var seq = [{_id: "0"}, {_id: "1"}, {_id: "2"}, {_id: "3"}];
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    seq = [{_id: "0"}, {_id: "2"}, {_id: "3"}, {_id: "1"}];
+    dep.changed();
+  }, [
+    {addedAt: ["0", {_id: "0"}, 0, null]},
+    {addedAt: ["1", {_id: "1"}, 1, null]},
+    {addedAt: ["2", {_id: "2"}, 2, null]},
+    {addedAt: ["3", {_id: "3"}, 3, null]},
+
+    {movedTo: ["1", {_id: "1"}, 1, 3, null]},
+    {changedAt: ["0", {_id: "0"}, {_id: "0"}, 0]},
+    {changedAt: ["1", {_id: "1"}, {_id: "1"}, 3]},
+    {changedAt: ["2", {_id: "2"}, {_id: "2"}, 1]},
+    {changedAt: ["3", {_id: "3"}, {_id: "3"}, 2]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - array to other array, movedTo later position but not the latest #2845', function (test) {
+  var dep = new Tracker.Dependency;
+  var seq = [{_id: "0"}, {_id: "1"}, {_id: "2"}, {_id: "3"}];
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    seq = [{_id: "1"}, {_id: "2"}, {_id: "0"}, {_id: "3"}];
+    dep.changed();
+  }, [
+    {addedAt: ["0", {_id: "0"}, 0, null]},
+    {addedAt: ["1", {_id: "1"}, 1, null]},
+    {addedAt: ["2", {_id: "2"}, 2, null]},
+    {addedAt: ["3", {_id: "3"}, 3, null]},
+
+    {movedTo: ["0", {_id: "0"}, 0, 2, "3"]},
+
+    {changedAt: ["0", {_id: "0"}, {_id: "0"}, 2]},
+    {changedAt: ["1", {_id: "1"}, {_id: "1"}, 0]},
+    {changedAt: ["2", {_id: "2"}, {_id: "2"}, 1]},
+    {changedAt: ["3", {_id: "3"}, {_id: "3"}, 3]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - array to other array, movedTo earlier position but not the first', function (test) {
+  var dep = new Tracker.Dependency;
+  var seq = [{_id: "0"}, {_id: "1"}, {_id: "2"}, {_id: "3"}, {_id: "4"}];
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    seq = [{_id: "0"}, {_id: "4"}, {_id: "1"}, {_id: "2"}, {_id: "3"}];
+    dep.changed();
+  }, [
+    {addedAt: ["0", {_id: "0"}, 0, null]},
+    {addedAt: ["1", {_id: "1"}, 1, null]},
+    {addedAt: ["2", {_id: "2"}, 2, null]},
+    {addedAt: ["3", {_id: "3"}, 3, null]},
+    {addedAt: ["4", {_id: "4"}, 4, null]},
+
+    {movedTo: ["4", {_id: "4"}, 4, 1, "1"]},
+
+    {changedAt: ["0", {_id: "0"}, {_id: "0"}, 0]},
+    {changedAt: ["1", {_id: "1"}, {_id: "1"}, 2]},
+    {changedAt: ["2", {_id: "2"}, {_id: "2"}, 3]},
+    {changedAt: ["3", {_id: "3"}, {_id: "3"}, 4]},
+    {changedAt: ["4", {_id: "4"}, {_id: "4"}, 1]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - array to null', function (test) {
+  var dep = new Tracker.Dependency;
+  var seq = [{_id: "13", foo: 1}, {_id: "37", bar: 2}];
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    seq = null;
+    dep.changed();
+  }, [
+    {addedAt: ["13", {_id: "13", foo: 1}, 0, null]},
+    {addedAt: ["37", {_id: "37", bar: 2}, 1, null]},
+    {removedAt: ["13", {_id: "13", foo: 1}, 0]},
+    {removedAt: ["37", {_id: "37", bar: 2}, 0]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - array to cursor', function (test) {
+  var dep = new Tracker.Dependency;
+  var seq = [{_id: "13", foo: 1}, {_id: "37", bar: 2}];
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    var coll = new Mongo.Collection(null);
+    coll.insert({_id: "13", foo: 1});
+    coll.insert({_id: "38", bar: 2});
+    var cursor = coll.find({}, {sort: {_id: 1}});
+    seq = cursor;
+    dep.changed();
+  }, [
+    {addedAt: ["13", {_id: "13", foo: 1}, 0, null]},
+    {addedAt: ["37", {_id: "37", bar: 2}, 1, null]},
+    {removedAt: ["37", {_id: "37", bar: 2}, 1]},
+    {addedAt: ["38", {_id: "38", bar: 2}, 1, null]},
+    {changedAt: ["13", {_id: "13", foo: 1}, {_id: "13", foo: 1}, 0]}
+  ]);
+});
+
+
+Tinytest.add('observe-sequence - cursor to null', function (test) {
+  var dep = new Tracker.Dependency;
+  var coll = new Mongo.Collection(null);
+  coll.insert({_id: "13", foo: 1});
+  coll.insert({_id: "37", bar: 2});
+  var cursor = coll.find({}, {sort: {_id: 1}});
+  var seq = cursor;
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    seq = null;
+    dep.changed();
+  }, [
+    {addedAt: ["13", {_id: "13", foo: 1}, 0, null]},
+    {addedAt: ["37", {_id: "37", bar: 2}, 1, null]},
+    {removedAt: ["13", {_id: "13", foo: 1}, 0]},
+    {removedAt: ["37", {_id: "37", bar: 2}, 0]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - cursor to array', function (test) {
+  var dep = new Tracker.Dependency;
+  var coll = new Mongo.Collection(null);
+  coll.insert({_id: "13", foo: 1});
+  var cursor = coll.find({}, {sort: {_id: 1}});
+  var seq = cursor;
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    coll.insert({_id: "37", bar: 2});
+    seq = [{_id: "13", foo: 1}, {_id: "38", bar: 2}];
+    dep.changed();
+  }, [
+    {addedAt: ["13", {_id: "13", foo: 1}, 0, null]},
+    {addedAt: ["37", {_id: "37", bar: 2}, 1, null]},
+    {removedAt: ["37", {_id: "37", bar: 2}, 1]},
+    {addedAt: ["38", {_id: "38", bar: 2}, 1, null]},
+    {changedAt: ["13", {_id: "13", foo: 1}, {_id: "13", foo: 1}, 0]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - cursor', function (test) {
+  var coll = new Mongo.Collection(null);
+  coll.insert({_id: "13", rank: 1});
+  var cursor = coll.find({}, {sort: {rank: 1}});
+  var seq = cursor;
+
+  runOneObserveSequenceTestCase(test, function () {
+    return seq;
+  }, function () {
+    coll.insert({_id: "37", rank: 2});
+    coll.insert({_id: "77", rank: 3});
+    coll.remove({_id: "37"});                           // should fire a 'removedAt' callback
+    coll.insert({_id: "11", rank: 0});                  // should fire an 'addedAt' callback
+    coll.update({_id: "13"}, {$set: {updated: true}});  // should fire an 'changedAt' callback
+    coll.update({_id: "77"}, {$set: {rank: -1}});       // should fire 'changedAt' and 'movedTo' callback
+  }, [
+    // this case must not fire spurious calls as the array to array
+    // case does. otherwise, the entire power of cursors is lost in
+    // blaze.
+    {addedAt: ["13", {_id: "13", rank: 1}, 0, null]},
+    {addedAt: ["37", {_id: "37", rank: 2}, 1, null]},
+    {addedAt: ["77", {_id: "77", rank: 3}, 2, null]},
+    {removedAt: ["37", {_id: "37", rank: 2}, 1]},
+    {addedAt: ["11", {_id: "11", rank: 0}, 0, "13"]},
+    {changedAt: ["13", {_id: "13", rank: 1, updated: true}, {_id: "13", rank: 1}, 1]},
+    {changedAt: ["77", {_id: "77", rank: -1}, {_id: "77", rank: 3}, 2]},
+    {movedTo: ["77", {_id: "77", rank: -1}, 2, 0, "11"]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - cursor to other cursor', function (test) {
+  var dep = new Tracker.Dependency;
+  var coll = new Mongo.Collection(null);
+  coll.insert({_id: "13", foo: 1});
+  var cursor = coll.find({}, {sort: {_id: 1}});
+  var seq = cursor;
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    coll.insert({_id: "37", bar: 2});
+
+    var newColl = new Mongo.Collection(null);
+    newColl.insert({_id: "13", foo: 1});
+    newColl.insert({_id: "38", bar: 2});
+    var newCursor = newColl.find({}, {sort: {_id: 1}});
+    seq = newCursor;
+    dep.changed();
+  }, [
+    {addedAt: ["13", {_id: "13", foo: 1}, 0, null]},
+    {addedAt: ["37", {_id: "37", bar: 2}, 1, null]},
+    {removedAt: ["37", {_id: "37", bar: 2}, 1]},
+    {addedAt: ["38", {_id: "38", bar: 2}, 1, null]},
+    {changedAt: ["13", {_id: "13", foo: 1}, {_id: "13", foo: 1}, 0]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - cursor to other cursor with transform', function (test) {
+  var dep = new Tracker.Dependency;
+  var transform = function(doc) {
+    return _.extend({idCopy: doc._id}, doc);
+  };
+
+  var coll = new Mongo.Collection(null, {transform: transform});
+  coll.insert({_id: "13", foo: 1});
+  var cursor = coll.find({}, {sort: {_id: 1}});
+  var seq = cursor;
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    coll.insert({_id: "37", bar: 2});
+
+    var newColl = new Mongo.Collection(null, {transform: transform});
+    newColl.insert({_id: "13", foo: 1});
+    newColl.insert({_id: "38", bar: 2});
+    var newCursor = newColl.find({}, {sort: {_id: 1}});
+    seq = newCursor;
+    dep.changed();
+  }, [
+    {addedAt: ["13", {_id: "13", foo: 1, idCopy: "13"}, 0, null]},
+    {addedAt: ["37", {_id: "37", bar: 2, idCopy: "37"}, 1, null]},
+    {removedAt: ["37", {_id: "37", bar: 2, idCopy: "37"}, 1]},
+    {addedAt: ["38", {_id: "38", bar: 2, idCopy: "38"}, 1, null]},
+    {changedAt: ["13", {_id: "13", foo: 1, idCopy: "13"}, {_id: "13", foo: 1, idCopy: "13"}, 0]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - cursor to same cursor', function (test) {
+  var coll = new Mongo.Collection(null);
+  coll.insert({_id: "13", rank: 1});
+  var cursor = coll.find({}, {sort: {rank: 1}});
+  var seq = cursor;
+  var dep = new Tracker.Dependency;
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    coll.insert({_id: "24", rank: 2});
+    dep.changed();
+    Tracker.flush();
+    coll.insert({_id: "78", rank: 3});
+  }, [
+    {addedAt: ["13", {_id: "13", rank: 1}, 0, null]},
+    {addedAt: ["24", {_id: "24", rank: 2}, 1, null]},
+    // even if the cursor changes to the same cursor, we do a diff,
+    // which leads to these 'changedAt' events.
+    {changedAt: ["13", {_id: "13", rank: 1}, {_id: "13", rank: 1}, 0]},
+    {changedAt: ["24", {_id: "24", rank: 2}, {_id: "24", rank: 2}, 1]},
+    {addedAt: ["78", {_id: "78", rank: 3}, 2, null]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - string arrays', function (test) {
+  var seq = ['A', 'B'];
+  var dep = new Tracker.Dependency;
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    seq = ['B', 'C'];
+    dep.changed();
+  }, [
+    {addedAt: ['-A', 'A', 0, null]},
+    {addedAt: ['-B', 'B', 1, null]},
+    {removedAt: ['-A', 'A', 0]},
+    {addedAt: ['-C', 'C', 1, null]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - number arrays', function (test) {
+  var seq = [1, 1, 2];
+  var dep = new Tracker.Dependency;
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    seq = [1, 3, 2, 3];
+    dep.changed();
+  }, [
+    {addedAt: [1, 1, 0, null]},
+    {addedAt: [{NOT: 1}, 1, 1, null]},
+    {addedAt: [2, 2, 2, null]},
+    {removedAt: [{NOT: 1}, 1, 1]},
+    {addedAt: [3, 3, 1, 2]},
+    {addedAt: [{NOT: 3}, 3, 3, null]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - number arrays, _id:0 correctly handled, no duplicate ids warning #4049', function (test) {
+  var seq = _.map(_.range(3), function (i) { return { _id: i}; });
+  var dep = new Tracker.Dependency;
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    // There was a bug before fixing #4049 that 0 wouldn't be handled well as an
+    // _id. An expression like `(item && item._id) || index` would incorrectly
+    // return '2' for the last item because the _id is falsy (although it is not
+    // undefined, but 0!).
+    seq = _.map([1, 2, 0], function (i) { return { _id: i}; });
+    dep.changed();
+  }, [
+    {addedAt: [0, {_id: 0}, 0, null]},
+    {addedAt: [1, {_id: 1}, 1, null]},
+    {addedAt: [2, {_id: 2}, 2, null]},
+    {movedTo: [0, {_id: 0}, 0, 2, null]},
+    {changedAt: [0, {_id: 0}, {_id: 0}, 2]},
+    {changedAt: [1, {_id: 1}, {_id: 1}, 0]},
+    {changedAt: [2, {_id: 2}, {_id: 2}, 1]}
+  ]);
+});
+
+Tinytest.add('observe-sequence - cursor to other cursor, same collection', function (test) {
+  var dep = new Tracker.Dependency;
+  var coll = new Mongo.Collection(null);
+  coll.insert({_id: "13", foo: 1});
+  coll.insert({_id: "37", foo: 2});
+  var cursor = coll.find({foo: 1});
+  var seq = cursor;
+
+  runOneObserveSequenceTestCase(test, function () {
+    dep.depend();
+    return seq;
+  }, function () {
+    var newCursor = coll.find({foo: 2});
+    seq = newCursor;
+    dep.changed();
+    Tracker.flush();
+    coll.insert({_id: "38", foo: 1});
+    coll.insert({_id: "39", foo: 2});
+  }, [
+    {addedAt: ["13", {_id: "13", foo: 1}, 0, null]},
+    {removedAt: ["13", {_id: "13", foo: 1}, 0]},
+    {addedAt: ["37", {_id: "37", foo: 2}, 0, null]},
+    {addedAt: ["39", {_id: "39", foo: 2}, 1, null]}
+  ]);
+});
+
+},{}],26:[function(require,module,exports){
 Tinytest.add('random', function (test) {
   // Deterministic with a specified seed, which should generate the
   // same sequence in all environments.
@@ -2438,123 +8639,7 @@ Tinytest.add('random - createWithSeeds requires parameters', function (test) {
   });
 });
 
-},{}],16:[function(require,module,exports){
-Tinytest.add("spacebars-compiler - compiler output", function (test) {
-
-  var run = function (input, expected) {
-    if (expected.fail) {
-      var expectedMessage = expected.fail;
-      // test for error starting with expectedMessage
-      var msg = '';
-      test.throws(function () {
-        try {
-          SpacebarsCompiler.compile(input, {isTemplate: true});
-        } catch (e) {
-          msg = e.message;
-          throw e;
-        }
-      });
-      test.equal(msg.slice(0, expectedMessage.length),
-                 expectedMessage);
-    } else {
-      var output = SpacebarsCompiler.compile(input, {isTemplate: true});
-      var postProcess = function (string) {
-        // remove initial and trailing parens
-        string = string.replace(/^\(([\S\s]*)\)$/, '$1');
-        if (! (Package['minifier-js'] && Package['minifier-js'].UglifyJSMinify)) {
-          // these tests work a lot better with access to beautification,
-          // but let's at least do some sort of test without it.
-          // These regexes may have to be adjusted if new tests are added.
-
-          // Remove single-line comments, including line nums from build system.
-          string = string.replace(/\/\/.*$/mg, '');
-          string = string.replace(/\s+/g, ''); // kill whitespace
-        }
-        return string;
-      };
-      // compare using Function .toString()!
-      test._stringEqual(
-        postProcess(output.toString()),
-        postProcess(
-          SpacebarsCompiler._beautify('(' + expected.toString() + ')')),
-        input);
-    }
-  };
-
-  coffee.runCompilerOutputTests(run);
-});
-
-coffee = {
-  runCompilerOutputTests: null // implemented in compiler_output_tests.coffee
-};
-
-
-Tinytest.add("spacebars-compiler - compiler errors", function (test) {
-
-  var getError = function (input) {
-    try {
-      SpacebarsCompiler.compile(input);
-    } catch (e) {
-      return e.message;
-    }
-    test.fail("Didn't throw an error: " + input);
-    return '';
-  };
-
-  var assertStartsWith = function (a, b) {
-    test.equal(a.substring(0, b.length), b);
-  };
-
-  var isError = function (input, errorStart) {
-    assertStartsWith(getError(input), errorStart);
-  };
-
-  isError("<input></input>",
-          "Unexpected HTML close tag.  <input> should have no close tag.");
-  isError("{{#each foo}}<input></input>{{/foo}}",
-          "Unexpected HTML close tag.  <input> should have no close tag.");
-
-  isError("{{#if}}{{/if}}", "#if requires an argument");
-  isError("{{#with}}{{/with}}", "#with requires an argument");
-  isError("{{#each}}{{/each}}", "#each requires an argument");
-  isError("{{#unless}}{{/unless}}", "#unless requires an argument");
-
-  isError("{{0 0}}", "Expected IDENTIFIER");
-
-  isError("{{> foo 0 0}}",
-          "First argument must be a function");
-  isError("{{> foo 0 x=0}}",
-          "First argument must be a function");
-  isError("{{#foo 0 0}}{{/foo}}",
-          "First argument must be a function");
-  isError("{{#foo 0 x=0}}{{/foo}}",
-          "First argument must be a function");
-
-  _.each(['asdf</br>', '{{!foo}}</br>', '{{!foo}} </br>',
-          'asdf</a>', '{{!foo}}</a>', '{{!foo}} </a>'], function (badFrag) {
-            isError(badFrag, "Unexpected HTML close tag");
-          });
-
-  isError("{{#let myHelper}}{{/let}}", "Incorrect form of #let");
-  isError("{{#each foo in.in bar}}{{/each}}", "Malformed #each");
-  isError("{{#each foo.bar in baz}}{{/each}}", "Bad variable name in #each");
-  isError("{{#each ../foo in baz}}{{/each}}", "Bad variable name in #each");
-  isError("{{#each 3 in baz}}{{/each}}", "Bad variable name in #each");
-
-  // errors using `{{> React}}`
-  isError("{{> React component=emptyComponent}}",
-          "{{> React}} must be used in a container element");
-  isError("<div>{{#if include}}{{> React component=emptyComponent}}{{/if}}</div>",
-          "{{> React}} must be used in a container element");
-  isError("<div><div>Sibling</div>{{> React component=emptyComponent}}</div>",
-          "{{> React}} must be used as the only child in a container element");
-  isError("<div>Sibling{{> React component=emptyComponent}}</div>",
-          "{{> React}} must be used as the only child in a container element");
-  isError("<div>{{#if sibling}}Sibling{{/if}}{{> React component=emptyComponent}}</div>",
-          "{{> React}} must be used as the only child in a container element");
-});
-
-},{}],17:[function(require,module,exports){
+},{}],27:[function(require,module,exports){
 Tinytest.add("spacebars-compiler - stache tags", function (test) {
 
   var run = function (input, expected) {
@@ -2873,7 +8958,199 @@ Tinytest.add("spacebars-compiler - parse", function (test) {
 
 });
 
-},{}],18:[function(require,module,exports){
+},{}],28:[function(require,module,exports){
+// This depends on tinytest, so it's a little weird to put it in
+// test-helpers, but it'll do for now.
+
+// Provides the testAsyncMulti helper, which creates an async test
+// (using Tinytest.addAsync) that tracks parallel and sequential
+// asynchronous calls.  Specifically, the two features it provides
+// are:
+// 1) Executing an array of functions sequentially when those functions
+//    contain async calls.
+// 2) Keeping track of when callbacks are outstanding, via "expect".
+//
+// To use, pass an array of functions that take arguments (test, expect).
+// (There is no onComplete callback; completion is determined automatically.)
+// Expect takes a callback closure and wraps it, returning a new callback closure,
+// and making a note that there is a callback oustanding.  Pass this returned closure
+// to async functions as the callback, and the machinery in the wrapper will
+// record the fact that the callback has been called.
+//
+// A second form of expect takes data arguments to test for.
+// Essentially, expect("foo", "bar") is equivalent to:
+// expect(function(arg1, arg2) { test.equal([arg1, arg2], ["foo", "bar"]); }).
+//
+// You cannot "nest" expect or call it from a callback!  Even if you have a chain
+// of callbacks, you need to call expect at the "top level" (synchronously)
+// but the callback you wrap has to be the last/innermost one.  This sometimes
+// leads to some code contortions and should probably be fixed.
+
+// Example: (at top level of test file)
+//
+// testAsyncMulti("test name", [
+//   function(test, expect) {
+//     ... tests here
+//     Meteor.defer(expect(function() {
+//       ... tests here
+//     }));
+//
+//     call_something_async('foo', 'bar', expect('baz')); // implicit callback
+//
+//   },
+//   function(test, expect) {
+//     ... more tests
+//   }
+// ]);
+
+var ExpectationManager = function (test, onComplete) {
+  var self = this;
+
+  self.test = test;
+  self.onComplete = onComplete;
+  self.closed = false;
+  self.dead = false;
+  self.outstanding = 0;
+};
+
+_.extend(ExpectationManager.prototype, {
+  expect: function (/* arguments */) {
+    var self = this;
+
+    if (typeof arguments[0] === "function")
+      var expected = arguments[0];
+    else
+      var expected = _.toArray(arguments);
+
+    if (self.closed)
+      throw new Error("Too late to add more expectations to the test");
+    self.outstanding++;
+
+    return function (/* arguments */) {
+      if (self.dead)
+        return;
+
+      if (typeof expected === "function") {
+        try {
+          expected.apply({}, arguments);
+        } catch (e) {
+          if (self.cancel())
+            self.test.exception(e);
+        }
+      } else {
+        self.test.equal(_.toArray(arguments), expected);
+      }
+
+      self.outstanding--;
+      self._check_complete();
+    };
+  },
+
+  done: function () {
+    var self = this;
+    self.closed = true;
+    self._check_complete();
+  },
+
+  cancel: function () {
+    var self = this;
+    if (! self.dead) {
+      self.dead = true;
+      return true;
+    }
+    return false;
+  },
+
+  _check_complete: function () {
+    var self = this;
+    if (!self.outstanding && self.closed && !self.dead) {
+      self.dead = true;
+      self.onComplete();
+    }
+  }
+});
+
+testAsyncMulti = function (name, funcs) {
+  // XXX Tests on remote browsers are _slow_. We need a better solution.
+  var timeout = 180000;
+
+  Tinytest.addAsync(name, function (test, onComplete) {
+    var remaining = _.clone(funcs);
+    var context = {};
+    var i = 0;
+
+    var runNext = function () {
+      var func = remaining.shift();
+      if (!func) {
+        delete test.extraDetails.asyncBlock;
+        onComplete();
+      }
+      else {
+        var em = new ExpectationManager(test, function () {
+          Meteor.clearTimeout(timer);
+          runNext();
+        });
+
+        var timer = Meteor.setTimeout(function () {
+          if (em.cancel()) {
+            test.fail({type: "timeout", message: "Async batch timed out"});
+            onComplete();
+          }
+          return;
+        }, timeout);
+
+        test.extraDetails.asyncBlock = i++;
+        try {
+          func.apply(context, [test, _.bind(em.expect, em)]);
+        } catch (exception) {
+          if (em.cancel())
+            test.exception(exception);
+          Meteor.clearTimeout(timer);
+          // Because we called test.exception, we're not to call onComplete.
+          return;
+        }
+        em.done();
+      }
+    };
+
+    runNext();
+  });
+};
+
+// Call `fn` periodically until it returns true.  If it does, call
+// `success`.  If it doesn't before the timeout, call `failed`.
+simplePoll = function (fn, success, failed, timeout, step) {
+  timeout = timeout || 10000;
+  step = step || 100;
+  var start = (new Date()).valueOf();
+  var helper = function () {
+    if (fn()) {
+      success();
+      return;
+    }
+    if (start + timeout < (new Date()).valueOf()) {
+      failed();
+      return;
+    }
+    Meteor.setTimeout(helper, step);
+  };
+  helper();
+};
+
+pollUntil = function (expect, f, timeout, step, noFail) {
+  noFail = noFail || false;
+  step = step || 100;
+  var expectation = expect(true);
+  simplePoll(
+    f,
+    function () { expectation(true) },
+    function () { expectation(noFail) },
+    timeout,
+    step
+  );
+};
+
+},{}],29:[function(require,module,exports){
 canonicalizeHtml = function(html) {
   var h = html;
   // kill IE-specific comments inserted by DomRange
@@ -2975,7 +9252,506 @@ canonicalizeHtml = function(html) {
   return h;
 };
 
-},{}],19:[function(require,module,exports){
+},{}],30:[function(require,module,exports){
+Tinytest.add('tracker - run', function (test) {
+  var d = new Tracker.Dependency;
+  var x = 0;
+  var handle = Tracker.autorun(function (handle) {
+    d.depend();
+    ++x;
+  });
+  test.equal(x, 1);
+  Tracker.flush();
+  test.equal(x, 1);
+  d.changed();
+  test.equal(x, 1);
+  Tracker.flush();
+  test.equal(x, 2);
+  d.changed();
+  test.equal(x, 2);
+  Tracker.flush();
+  test.equal(x, 3);
+  d.changed();
+  // Prevent the function from running further.
+  handle.stop();
+  Tracker.flush();
+  test.equal(x, 3);
+  d.changed();
+  Tracker.flush();
+  test.equal(x, 3);
+
+  Tracker.autorun(function (internalHandle) {
+    d.depend();
+    ++x;
+    if (x == 6)
+      internalHandle.stop();
+  });
+  test.equal(x, 4);
+  d.changed();
+  Tracker.flush();
+  test.equal(x, 5);
+  d.changed();
+  // Increment to 6 and stop.
+  Tracker.flush();
+  test.equal(x, 6);
+  d.changed();
+  Tracker.flush();
+  // Still 6!
+  test.equal(x, 6);
+
+  test.throws(function () {
+    Tracker.autorun();
+  });
+  test.throws(function () {
+    Tracker.autorun({});
+  });
+});
+
+Tinytest.add("tracker - nested run", function (test) {
+  var a = new Tracker.Dependency;
+  var b = new Tracker.Dependency;
+  var c = new Tracker.Dependency;
+  var d = new Tracker.Dependency;
+  var e = new Tracker.Dependency;
+  var f = new Tracker.Dependency;
+
+  var buf = "";
+
+  var c1 = Tracker.autorun(function () {
+    a.depend();
+    buf += 'a';
+    Tracker.autorun(function () {
+      b.depend();
+      buf += 'b';
+      Tracker.autorun(function () {
+        c.depend();
+        buf += 'c';
+        var c2 = Tracker.autorun(function () {
+          d.depend();
+          buf += 'd';
+          Tracker.autorun(function () {
+            e.depend();
+            buf += 'e';
+            Tracker.autorun(function () {
+              f.depend();
+              buf += 'f';
+            });
+          });
+          Tracker.onInvalidate(function () {
+            // only run once
+            c2.stop();
+          });
+        });
+      });
+    });
+    Tracker.onInvalidate(function (c1) {
+      c1.stop();
+    });
+  });
+
+  var expect = function (str) {
+    test.equal(buf, str);
+    buf = "";
+  };
+
+  expect('abcdef');
+
+  b.changed();
+  expect(''); // didn't flush yet
+  Tracker.flush();
+  expect('bcdef');
+
+  c.changed();
+  Tracker.flush();
+  expect('cdef');
+
+  var changeAndExpect = function (v, str) {
+    v.changed();
+    Tracker.flush();
+    expect(str);
+  };
+
+  // should cause running
+  changeAndExpect(e, 'ef');
+  changeAndExpect(f, 'f');
+  // invalidate inner context
+  changeAndExpect(d, '');
+  // no more running!
+  changeAndExpect(e, '');
+  changeAndExpect(f, '');
+  // rerun C
+  changeAndExpect(c, 'cdef');
+  changeAndExpect(e, 'ef');
+  changeAndExpect(f, 'f');
+  // rerun B
+  changeAndExpect(b, 'bcdef');
+  changeAndExpect(e, 'ef');
+  changeAndExpect(f, 'f');
+  // kill A
+  a.changed();
+  changeAndExpect(f, '');
+  changeAndExpect(e, '');
+  changeAndExpect(d, '');
+  changeAndExpect(c, '');
+  changeAndExpect(b, '');
+  changeAndExpect(a, '');
+
+  test.isFalse(a.hasDependents());
+  test.isFalse(b.hasDependents());
+  test.isFalse(c.hasDependents());
+  test.isFalse(d.hasDependents());
+  test.isFalse(e.hasDependents());
+  test.isFalse(f.hasDependents());
+});
+
+Tinytest.add("tracker - flush", function (test) {
+
+  var buf = "";
+
+  var c1 = Tracker.autorun(function (c) {
+    buf += 'a';
+    // invalidate first time
+    if (c.firstRun)
+      c.invalidate();
+  });
+
+  test.equal(buf, 'a');
+  Tracker.flush();
+  test.equal(buf, 'aa');
+  Tracker.flush();
+  test.equal(buf, 'aa');
+  c1.stop();
+  Tracker.flush();
+  test.equal(buf, 'aa');
+
+  //////
+
+  buf = "";
+
+  var c2 = Tracker.autorun(function (c) {
+    buf += 'a';
+    // invalidate first time
+    if (c.firstRun)
+      c.invalidate();
+
+    Tracker.onInvalidate(function () {
+      buf += "*";
+    });
+  });
+
+  test.equal(buf, 'a*');
+  Tracker.flush();
+  test.equal(buf, 'a*a');
+  c2.stop();
+  test.equal(buf, 'a*a*');
+  Tracker.flush();
+  test.equal(buf, 'a*a*');
+
+  /////
+  // Can flush a diferent run from a run;
+  // no current computation in afterFlush
+
+  buf = "";
+
+  var c3 = Tracker.autorun(function (c) {
+    buf += 'a';
+    // invalidate first time
+    if (c.firstRun)
+      c.invalidate();
+    Tracker.afterFlush(function () {
+      buf += (Tracker.active ? "1" : "0");
+    });
+  });
+
+  Tracker.afterFlush(function () {
+    buf += 'c';
+  });
+
+  var c4 = Tracker.autorun(function (c) {
+    c4 = c;
+    buf += 'b';
+  });
+
+  Tracker.flush();
+  test.equal(buf, 'aba0c0');
+  c3.stop();
+  c4.stop();
+  Tracker.flush();
+
+  // cases where flush throws
+
+  var ran = false;
+  Tracker.afterFlush(function (arg) {
+    ran = true;
+    test.equal(typeof arg, 'undefined');
+    test.throws(function () {
+      Tracker.flush(); // illegal nested flush
+    });
+  });
+
+  Tracker.flush();
+  test.isTrue(ran);
+
+  test.throws(function () {
+    Tracker.autorun(function () {
+      Tracker.flush(); // illegal to flush from a computation
+    });
+  });
+
+  test.throws(function () {
+    Tracker.autorun(function () {
+      Tracker.autorun(function () {});
+      Tracker.flush();
+    });
+  });
+});
+
+Tinytest.add("tracker - lifecycle", function (test) {
+
+  test.isFalse(Tracker.active);
+  test.equal(null, Tracker.currentComputation);
+
+  var runCount = 0;
+  var firstRun = true;
+  var buf = [];
+  var cbId = 1;
+  var makeCb = function () {
+    var id = cbId++;
+    return function () {
+      buf.push(id);
+    };
+  };
+
+  var shouldStop = false;
+
+  var c1 = Tracker.autorun(function (c) {
+    test.isTrue(Tracker.active);
+    test.equal(c, Tracker.currentComputation);
+    test.equal(c.stopped, false);
+    test.equal(c.invalidated, false);
+      test.equal(c.firstRun, firstRun);
+
+    Tracker.onInvalidate(makeCb()); // 1, 6, ...
+    Tracker.afterFlush(makeCb()); // 2, 7, ...
+
+    Tracker.autorun(function (x) {
+      x.stop();
+      c.onInvalidate(makeCb()); // 3, 8, ...
+
+      Tracker.onInvalidate(makeCb()); // 4, 9, ...
+      Tracker.afterFlush(makeCb()); // 5, 10, ...
+    });
+    runCount++;
+
+    if (shouldStop)
+      c.stop();
+  });
+
+  firstRun = false;
+
+  test.equal(runCount, 1);
+
+  test.equal(buf, [4]);
+  c1.invalidate();
+  test.equal(runCount, 1);
+  test.equal(c1.invalidated, true);
+  test.equal(c1.stopped, false);
+  test.equal(buf, [4, 1, 3]);
+
+  Tracker.flush();
+
+  test.equal(runCount, 2);
+  test.equal(c1.invalidated, false);
+  test.equal(buf, [4, 1, 3, 9, 2, 5, 7, 10]);
+
+  // test self-stop
+  buf.length = 0;
+  shouldStop = true;
+  c1.invalidate();
+  test.equal(buf, [6, 8]);
+  Tracker.flush();
+  test.equal(buf, [6, 8, 14, 11, 13, 12, 15]);
+
+});
+
+Tinytest.add("tracker - onInvalidate", function (test) {
+  var buf = "";
+
+  var c1 = Tracker.autorun(function () {
+    buf += "*";
+  });
+
+  var append = function (x, expectedComputation) {
+    return function (givenComputation) {
+      test.isFalse(Tracker.active);
+      test.equal(givenComputation, expectedComputation || c1);
+      buf += x;
+    };
+  };
+
+  c1.onStop(append('s'));
+
+  c1.onInvalidate(append('a'));
+  c1.onInvalidate(append('b'));
+  test.equal(buf, '*');
+  Tracker.autorun(function (me) {
+    Tracker.onInvalidate(append('z', me));
+    me.stop();
+    test.equal(buf, '*z');
+    c1.invalidate();
+  });
+  test.equal(buf, '*zab');
+  c1.onInvalidate(append('c'));
+  c1.onInvalidate(append('d'));
+  test.equal(buf, '*zabcd');
+  Tracker.flush();
+  test.equal(buf, '*zabcd*');
+
+  // afterFlush ordering
+  buf = '';
+  c1.onInvalidate(append('a'));
+  c1.onInvalidate(append('b'));
+  Tracker.afterFlush(function () {
+    append('x')(c1);
+    c1.onInvalidate(append('c'));
+    c1.invalidate();
+    Tracker.afterFlush(function () {
+      append('y')(c1);
+      c1.onInvalidate(append('d'));
+      c1.invalidate();
+    });
+  });
+  Tracker.afterFlush(function () {
+    append('z')(c1);
+    c1.onInvalidate(append('e'));
+    c1.invalidate();
+  });
+
+  test.equal(buf, '');
+  Tracker.flush();
+  test.equal(buf, 'xabc*ze*yd*');
+
+  buf = "";
+  c1.onInvalidate(append('m'));
+  Tracker.flush();
+  test.equal(buf, '');
+  c1.stop();
+  test.equal(buf, 'ms');  // s is from onStop
+  Tracker.flush();
+  test.equal(buf, 'ms');
+  c1.onStop(append('S'));
+  test.equal(buf, 'msS');
+});
+
+Tinytest.add('tracker - invalidate at flush time', function (test) {
+  // Test this sentence of the docs: Functions are guaranteed to be
+  // called at a time when there are no invalidated computations that
+  // need rerunning.
+
+  var buf = [];
+
+  Tracker.afterFlush(function () {
+    buf.push('C');
+  });
+
+  // When c1 is invalidated, it invalidates c2, then stops.
+  var c1 = Tracker.autorun(function (c) {
+    if (! c.firstRun) {
+      buf.push('A');
+      c2.invalidate();
+      c.stop();
+    }
+  });
+
+  var c2 = Tracker.autorun(function (c) {
+    if (! c.firstRun) {
+      buf.push('B');
+      c.stop();
+    }
+  });
+
+  // Invalidate c1.  If all goes well, the re-running of
+  // c2 should happen before the afterFlush.
+  c1.invalidate();
+  Tracker.flush();
+
+  test.equal(buf.join(''), 'ABC');
+
+});
+
+Tinytest.add('tracker - throwFirstError', function (test) {
+  var d = new Tracker.Dependency;
+  Tracker.autorun(function (c) {
+    d.depend();
+
+    if (!c.firstRun)
+      throw new Error("foo");
+  });
+
+  d.changed();
+  // doesn't throw; logs instead.
+  Meteor._suppress_log(1);
+  Tracker.flush();
+
+  d.changed();
+  test.throws(function () {
+    Tracker.flush({_throwFirstError: true});
+  }, /foo/);
+});
+
+Tinytest.addAsync('tracker - no infinite recomputation', function (test, onComplete) {
+  var reran = false;
+  var c = Tracker.autorun(function (c) {
+    if (! c.firstRun)
+      reran = true;
+    c.invalidate();
+  });
+  test.isFalse(reran);
+  Meteor.setTimeout(function () {
+    c.stop();
+    Tracker.afterFlush(function () {
+      test.isTrue(reran);
+      test.isTrue(c.stopped);
+      onComplete();
+    });
+  }, 100);
+});
+
+Tinytest.add('tracker - Tracker.flush finishes', function (test) {
+  // Currently, _runFlush will "yield" every 1000 computations... unless run in
+  // Tracker.flush. So this test validates that Tracker.flush is capable of
+  // running 2000 computations. Which isn't quite the same as infinity, but it's
+  // getting there.
+  var n = 0;
+  var c = Tracker.autorun(function (c) {
+    if (++n < 2000) {
+      c.invalidate();
+    }
+  });
+  test.equal(n, 1);
+  Tracker.flush();
+  test.equal(n, 2000);
+});
+
+testAsyncMulti('tracker - Tracker.autorun, onError option', [function (test, expect) {
+  var d = new Tracker.Dependency;
+  var c = Tracker.autorun(function (c) {
+    d.depend();
+
+    if (! c.firstRun)
+      throw new Error("foo");
+  }, {
+    onError: expect(function (err) {
+      test.equal(err.message, "foo");
+    })
+  });
+
+  d.changed();
+  Tracker.flush();
+}]);
+
+
+},{}],31:[function(require,module,exports){
 module.exports=function(Meteor) {
   var Base64;
 // Base 64 encoding
@@ -3125,7 +9901,7 @@ Base64.decode = function (str) {
   Meteor.Base64 = Base64;
 };
 
-},{}],20:[function(require,module,exports){
+},{}],32:[function(require,module,exports){
 module.exports = function(Meteor) {
   var toObjectLiteralKey;
   var _ = Meteor.underscore;
@@ -3487,7 +10263,7 @@ BlazeTools.parseStringLiteral = function (scanner) {
   Meteor.BlazeTools = BlazeTools;
 };
 
-},{}],21:[function(require,module,exports){
+},{}],33:[function(require,module,exports){
 module.exports = function(Meteor,jQuery) {
   var AttributeHandler, makeAttributeHandler, ElementAttributesUpdater, toObjectLiteralKey;
   var _ = Meteor.underscore;
@@ -4666,8 +11442,9 @@ var UrlHandler = AttributeHandler.extend({
       origUpdate.apply(self, args);
     } else {
       var isJavascriptProtocol = (getUrlProtocol(value) === "javascript:");
-      if (isJavascriptProtocol) {
-        Blaze._warn("URLs that use the 'javascript:' protocol are not " +
+      var isVBScriptProtocol   = (getUrlProtocol(value) === "vbscript:");
+      if (isJavascriptProtocol || isVBScriptProtocol) {
+        Blaze._warn("URLs that use the 'javascript:' or 'vbscript:' protocol are not " +
                     "allowed in URL attribute values. " +
                     "Call Blaze._allowJavascriptUrls() " +
                     "to enable them.");
@@ -6270,6 +13047,11 @@ Blaze.registerHelper = function (name, func) {
   Blaze._globalHelpers[name] = func;
 };
 
+// Also documented as Template.deregisterHelper
+Blaze.deregisterHelper = function(name) {
+  delete Blaze._globalHelpers[name];
+}
+
 var bindIfIsFunction = function (x, target) {
   if (typeof x !== 'function')
     return x;
@@ -6566,6 +13348,7 @@ Blaze.isTemplate = function (t) {
  * @summary Register a function to be called when an instance of this template is created.
  * @param {Function} callback A function to be added as a callback.
  * @locus Client
+ * @importFromPackage templating
  */
 Template.prototype.onCreated = function (cb) {
   this._callbacks.created.push(cb);
@@ -6578,6 +13361,7 @@ Template.prototype.onCreated = function (cb) {
  * @summary Register a function to be called when an instance of this template is inserted into the DOM.
  * @param {Function} callback A function to be added as a callback.
  * @locus Client
+ * @importFromPackage templating
  */
 Template.prototype.onRendered = function (cb) {
   this._callbacks.rendered.push(cb);
@@ -6590,6 +13374,7 @@ Template.prototype.onRendered = function (cb) {
  * @summary Register a function to be called when an instance of this template is removed from the DOM and destroyed.
  * @param {Function} callback A function to be added as a callback.
  * @locus Client
+ * @importFromPackage templating
  */
 Template.prototype.onDestroyed = function (cb) {
   this._callbacks.destroyed.push(cb);
@@ -6932,6 +13717,7 @@ Blaze.TemplateInstance.prototype.subscriptionsReady = function () {
  * @summary Specify template helpers available to this template.
  * @locus Client
  * @param {Object} helpers Dictionary of helper functions by name.
+ * @importFromPackage templating
  */
 Template.prototype.helpers = function (dict) {
   if (! _.isObject(dict)) {
@@ -6965,6 +13751,7 @@ Template._withTemplateInstanceFunc = function (templateInstanceFunc, func) {
  * @summary Specify event handlers for this template.
  * @locus Client
  * @param {EventMap} eventMap Event handlers to associate with this template.
+ * @importFromPackage templating
  */
 Template.prototype.events = function (eventMap) {
   if (! _.isObject(eventMap)) {
@@ -7001,6 +13788,7 @@ Template.prototype.events = function (eventMap) {
  * @summary The [template instance](#template_inst) corresponding to the current template helper, event handler, callback, or autorun.  If there isn't one, `null`.
  * @locus Client
  * @returns {Blaze.TemplateInstance}
+ * @importFromPackage templating
  */
 Template.instance = function () {
   return Template._currentTemplateInstanceFunc
@@ -7023,6 +13811,7 @@ Template.instance = function () {
  * Establishes a reactive dependency on the result.
  * @locus Client
  * @function
+ * @importFromPackage templating
  */
 Template.currentData = Blaze.getData;
 
@@ -7031,6 +13820,7 @@ Template.currentData = Blaze.getData;
  * @locus Client
  * @function
  * @param {Integer} [numLevels] The number of levels beyond the current data context to look. Defaults to 1.
+ * @importFromPackage templating
  */
 Template.parentData = Blaze._parentData;
 
@@ -7040,23 +13830,58 @@ Template.parentData = Blaze._parentData;
  * @function
  * @param {String} name The name of the helper function you are defining.
  * @param {Function} function The helper function itself.
+ * @importFromPackage templating
  */
 Template.registerHelper = Blaze.registerHelper;
+
+/**
+ * @summary Removes a global [helper function](#template_helpers).
+ * @locus Client
+ * @function
+ * @param {String} name The name of the helper function you are defining.
+ * @importFromPackage templating
+ */
+Template.deregisterHelper = Blaze.deregisterHelper;
   Meteor.Blaze = Blaze;
   Meteor.jQuery = jQuery;
 };
 
-},{}],22:[function(require,module,exports){
+},{}],34:[function(require,module,exports){
+(function (process){
 module.exports = function(underscore) {
   var Meteor;
+  var meteorEnv;
   var _ = underscore; 
   var Package = {};
+
+  var __meteor_runtime_config__ = {
+	meteorEnv : {
+			NODE_ENV : process.env.NODE_ENV || 'production'
+		}
+  };
+
+meteorEnv = __meteor_runtime_config__.meteorEnv;
 
 /**
  * @summary The Meteor namespace
  * @namespace Meteor
  */
 Meteor = {
+  /**
+   * @summary Boolean variable.  True if running in production environment.
+   * @locus Anywhere
+   * @static
+   * @type {Boolean}
+   */
+  isProduction: meteorEnv.NODE_ENV === "production",
+
+  /**
+   * @summary Boolean variable.  True if running in development environment.
+   * @locus Anywhere
+   * @static
+   * @type {Boolean}
+   */
+  isDevelopment: meteorEnv.NODE_ENV !== "production",
 
   /**
    * @summary Boolean variable.  True if running in client environment.
@@ -7085,6 +13910,94 @@ if (typeof __meteor_runtime_config__ === 'object' &&
    */
   Meteor.settings = { 'public': __meteor_runtime_config__.PUBLIC_SETTINGS };
 }
+var callbackQueue = [];
+var isLoadingCompleted = false;
+var isReady = false;
+
+// Keeps track of how many events to wait for in addition to loading completing,
+// before we're considered ready.
+var readyHoldsCount = 0;
+
+var holdReady =  function () {
+  readyHoldsCount++;
+}
+
+var releaseReadyHold = function () {
+  readyHoldsCount--;
+  maybeReady();
+}
+
+var maybeReady = function () {
+  if (isReady || !isLoadingCompleted || readyHoldsCount > 0)
+    return;
+
+  isReady = true;
+
+  // Run startup callbacks
+  while (callbackQueue.length)
+    (callbackQueue.shift())();
+
+  if (Meteor.isCordova) {
+    // Notify the WebAppLocalServer plugin that startup was completed successfully,
+    // so we can roll back faulty versions if this doesn't happen
+    WebAppLocalServer.startupDidComplete();
+  }
+};
+
+var loadingCompleted = function () {
+  if (!isLoadingCompleted) {
+    isLoadingCompleted = true;
+    maybeReady();
+  }
+}
+
+if (Meteor.isCordova) {
+  holdReady();
+  document.addEventListener('deviceready', releaseReadyHold, false);
+}
+
+if (document.readyState === 'complete' || document.readyState === 'loaded') {
+  // Loading has completed,
+  // but allow other scripts the opportunity to hold ready
+  window.setTimeout(loadingCompleted);
+} else { // Attach event listeners to wait for loading to complete
+  if (document.addEventListener) {
+    document.addEventListener('DOMContentLoaded', loadingCompleted, false);
+    window.addEventListener('load', loadingCompleted, false);
+  } else { // Use IE event model for < IE9
+    document.attachEvent('onreadystatechange', function () {
+      if (document.readyState === "complete") {
+        loadingCompleted();
+      }
+    });
+    window.attachEvent('load', loadingCompleted);
+  }
+}
+
+/**
+ * @summary Run code when a client or a server starts.
+ * @locus Anywhere
+ * @param {Function} func A function to run on startup.
+ */
+Meteor.startup = function (callback) {
+  // Fix for < IE9, see http://javascript.nwbox.com/IEContentLoaded/
+  var doScroll = !document.addEventListener &&
+    document.documentElement.doScroll;
+
+  if (!doScroll || window !== top) {
+    if (isReady)
+      callback();
+    else
+      callbackQueue.push(callback);
+  } else {
+    try { doScroll('left'); }
+    catch (error) {
+      setTimeout(function () { Meteor.startup(callback); }, 50);
+      return;
+    };
+    callback();
+  }
+};
 var suppress = 0;
 
 // replacement for console.log. This is a temporary API. We should
@@ -7477,26 +14390,19 @@ Meteor._nodeCodeMustBeInFiber = function () {
 //
 Meteor.makeErrorType = function (name, constructor) {
   var errorClass = function (/*arguments*/) {
-    var self = this;
-
     // Ensure we get a proper stack trace in most Javascript environments
     if (Error.captureStackTrace) {
       // V8 environments (Chrome and Node.js)
-      Error.captureStackTrace(self, errorClass);
+      Error.captureStackTrace(this, errorClass);
     } else {
-      // Firefox
-      var e = new Error;
-      e.__proto__ = errorClass.prototype;
-      if (e instanceof errorClass)
-        self = e;
+      // Borrow the .stack property of a native Error object.
+      this.stack = new Error().stack;
     }
     // Safari magically works.
 
-    constructor.apply(self, arguments);
+    constructor.apply(this, arguments);
 
-    self.errorType = name;
-
-    return self;
+    this.errorType = name;
   };
 
   Meteor._inherits(errorClass, Error);
@@ -7798,7 +14704,7 @@ _.extend(Meteor, {
   }
 });
 /**
- * @summary Generate an absolute URL pointing to the application. The server reads from the `ROOT_URL` environment variable to determine where it is running. This is taken care of automatically for apps deployed with `meteor deploy`, but must be provided when using `meteor build`.
+ * @summary Generate an absolute URL pointing to the application. The server reads from the `ROOT_URL` environment variable to determine where it is running. This is taken care of automatically for apps deployed to Galaxy, but must be provided when using `meteor build`.
  * @locus Anywhere
  * @param {String} [path] A path to append to the root URL. Do not include a leading "`/`".
  * @param {Object} [options]
@@ -7856,10 +14762,270 @@ Meteor._relativeToSiteRootUrl = function (link) {
   return link;
 };
   Meteor.underscore = _;
+  Meteor.__meteor_runtime_config__ = __meteor_runtime_config__;
   return Meteor;
 };
 
-},{}],23:[function(require,module,exports){
+}).call(this,require('_process'))
+},{"_process":1}],35:[function(require,module,exports){
+module.exports=function(Meteor) {
+  var _ = Meteor.underscore;
+  var DiffSequence;
+DiffSequence = {};
+
+// ordered: bool.
+// old_results and new_results: collections of documents.
+//    if ordered, they are arrays.
+//    if unordered, they are IdMaps
+DiffSequence.diffQueryChanges = function (ordered, oldResults, newResults,
+                                              observer, options) {
+  if (ordered)
+    DiffSequence.diffQueryOrderedChanges(
+      oldResults, newResults, observer, options);
+  else
+    DiffSequence.diffQueryUnorderedChanges(
+      oldResults, newResults, observer, options);
+};
+
+DiffSequence.diffQueryUnorderedChanges = function (oldResults, newResults,
+                                                       observer, options) {
+  options = options || {};
+  var projectionFn = options.projectionFn || EJSON.clone;
+
+  if (observer.movedBefore) {
+    throw new Error("_diffQueryUnordered called with a movedBefore observer!");
+  }
+
+  newResults.forEach(function (newDoc, id) {
+    var oldDoc = oldResults.get(id);
+    if (oldDoc) {
+      if (observer.changed && !EJSON.equals(oldDoc, newDoc)) {
+        var projectedNew = projectionFn(newDoc);
+        var projectedOld = projectionFn(oldDoc);
+        var changedFields =
+              DiffSequence.makeChangedFields(projectedNew, projectedOld);
+        if (! _.isEmpty(changedFields)) {
+          observer.changed(id, changedFields);
+        }
+      }
+    } else if (observer.added) {
+      var fields = projectionFn(newDoc);
+      delete fields._id;
+      observer.added(newDoc._id, fields);
+    }
+  });
+
+  if (observer.removed) {
+    oldResults.forEach(function (oldDoc, id) {
+      if (!newResults.has(id))
+        observer.removed(id);
+    });
+  }
+};
+
+
+DiffSequence.diffQueryOrderedChanges = function (old_results, new_results,
+                                                     observer, options) {
+  options = options || {};
+  var projectionFn = options.projectionFn || EJSON.clone;
+
+  var new_presence_of_id = {};
+  _.each(new_results, function (doc) {
+    if (new_presence_of_id[doc._id])
+      Meteor._debug("Duplicate _id in new_results");
+    new_presence_of_id[doc._id] = true;
+  });
+
+  var old_index_of_id = {};
+  _.each(old_results, function (doc, i) {
+    if (doc._id in old_index_of_id)
+      Meteor._debug("Duplicate _id in old_results");
+    old_index_of_id[doc._id] = i;
+  });
+
+  // ALGORITHM:
+  //
+  // To determine which docs should be considered "moved" (and which
+  // merely change position because of other docs moving) we run
+  // a "longest common subsequence" (LCS) algorithm.  The LCS of the
+  // old doc IDs and the new doc IDs gives the docs that should NOT be
+  // considered moved.
+
+  // To actually call the appropriate callbacks to get from the old state to the
+  // new state:
+
+  // First, we call removed() on all the items that only appear in the old
+  // state.
+
+  // Then, once we have the items that should not move, we walk through the new
+  // results array group-by-group, where a "group" is a set of items that have
+  // moved, anchored on the end by an item that should not move.  One by one, we
+  // move each of those elements into place "before" the anchoring end-of-group
+  // item, and fire changed events on them if necessary.  Then we fire a changed
+  // event on the anchor, and move on to the next group.  There is always at
+  // least one group; the last group is anchored by a virtual "null" id at the
+  // end.
+
+  // Asymptotically: O(N k) where k is number of ops, or potentially
+  // O(N log N) if inner loop of LCS were made to be binary search.
+
+
+  //////// LCS (longest common sequence, with respect to _id)
+  // (see Wikipedia article on Longest Increasing Subsequence,
+  // where the LIS is taken of the sequence of old indices of the
+  // docs in new_results)
+  //
+  // unmoved: the output of the algorithm; members of the LCS,
+  // in the form of indices into new_results
+  var unmoved = [];
+  // max_seq_len: length of LCS found so far
+  var max_seq_len = 0;
+  // seq_ends[i]: the index into new_results of the last doc in a
+  // common subsequence of length of i+1 <= max_seq_len
+  var N = new_results.length;
+  var seq_ends = new Array(N);
+  // ptrs:  the common subsequence ending with new_results[n] extends
+  // a common subsequence ending with new_results[ptr[n]], unless
+  // ptr[n] is -1.
+  var ptrs = new Array(N);
+  // virtual sequence of old indices of new results
+  var old_idx_seq = function(i_new) {
+    return old_index_of_id[new_results[i_new]._id];
+  };
+  // for each item in new_results, use it to extend a common subsequence
+  // of length j <= max_seq_len
+  for(var i=0; i<N; i++) {
+    if (old_index_of_id[new_results[i]._id] !== undefined) {
+      var j = max_seq_len;
+      // this inner loop would traditionally be a binary search,
+      // but scanning backwards we will likely find a subseq to extend
+      // pretty soon, bounded for example by the total number of ops.
+      // If this were to be changed to a binary search, we'd still want
+      // to scan backwards a bit as an optimization.
+      while (j > 0) {
+        if (old_idx_seq(seq_ends[j-1]) < old_idx_seq(i))
+          break;
+        j--;
+      }
+
+      ptrs[i] = (j === 0 ? -1 : seq_ends[j-1]);
+      seq_ends[j] = i;
+      if (j+1 > max_seq_len)
+        max_seq_len = j+1;
+    }
+  }
+
+  // pull out the LCS/LIS into unmoved
+  var idx = (max_seq_len === 0 ? -1 : seq_ends[max_seq_len-1]);
+  while (idx >= 0) {
+    unmoved.push(idx);
+    idx = ptrs[idx];
+  }
+  // the unmoved item list is built backwards, so fix that
+  unmoved.reverse();
+
+  // the last group is always anchored by the end of the result list, which is
+  // an id of "null"
+  unmoved.push(new_results.length);
+
+  _.each(old_results, function (doc) {
+    if (!new_presence_of_id[doc._id])
+      observer.removed && observer.removed(doc._id);
+  });
+  // for each group of things in the new_results that is anchored by an unmoved
+  // element, iterate through the things before it.
+  var startOfGroup = 0;
+  _.each(unmoved, function (endOfGroup) {
+    var groupId = new_results[endOfGroup] ? new_results[endOfGroup]._id : null;
+    var oldDoc, newDoc, fields, projectedNew, projectedOld;
+    for (var i = startOfGroup; i < endOfGroup; i++) {
+      newDoc = new_results[i];
+      if (!_.has(old_index_of_id, newDoc._id)) {
+        fields = projectionFn(newDoc);
+        delete fields._id;
+        observer.addedBefore && observer.addedBefore(newDoc._id, fields, groupId);
+        observer.added && observer.added(newDoc._id, fields);
+      } else {
+        // moved
+        oldDoc = old_results[old_index_of_id[newDoc._id]];
+        projectedNew = projectionFn(newDoc);
+        projectedOld = projectionFn(oldDoc);
+        fields = DiffSequence.makeChangedFields(projectedNew, projectedOld);
+        if (!_.isEmpty(fields)) {
+          observer.changed && observer.changed(newDoc._id, fields);
+        }
+        observer.movedBefore && observer.movedBefore(newDoc._id, groupId);
+      }
+    }
+    if (groupId) {
+      newDoc = new_results[endOfGroup];
+      oldDoc = old_results[old_index_of_id[newDoc._id]];
+      projectedNew = projectionFn(newDoc);
+      projectedOld = projectionFn(oldDoc);
+      fields = DiffSequence.makeChangedFields(projectedNew, projectedOld);
+      if (!_.isEmpty(fields)) {
+        observer.changed && observer.changed(newDoc._id, fields);
+      }
+    }
+    startOfGroup = endOfGroup+1;
+  });
+
+
+};
+
+
+// General helper for diff-ing two objects.
+// callbacks is an object like so:
+// { leftOnly: function (key, leftValue) {...},
+//   rightOnly: function (key, rightValue) {...},
+//   both: function (key, leftValue, rightValue) {...},
+// }
+DiffSequence.diffObjects = function (left, right, callbacks) {
+  _.each(left, function (leftValue, key) {
+    if (_.has(right, key))
+      callbacks.both && callbacks.both(key, leftValue, right[key]);
+    else
+      callbacks.leftOnly && callbacks.leftOnly(key, leftValue);
+  });
+  if (callbacks.rightOnly) {
+    _.each(right, function(rightValue, key) {
+      if (!_.has(left, key))
+        callbacks.rightOnly(key, rightValue);
+    });
+  }
+};
+
+
+DiffSequence.makeChangedFields = function (newDoc, oldDoc) {
+  var fields = {};
+  DiffSequence.diffObjects(oldDoc, newDoc, {
+    leftOnly: function (key, value) {
+      fields[key] = undefined;
+    },
+    rightOnly: function (key, value) {
+      fields[key] = value;
+    },
+    both: function (key, leftValue, rightValue) {
+      if (!EJSON.equals(leftValue, rightValue))
+        fields[key] = rightValue;
+    }
+  });
+  return fields;
+};
+
+DiffSequence.applyChanges = function (doc, changeFields) {
+  _.each(changeFields, function (value, key) {
+    if (value === undefined)
+      delete doc[key];
+    else
+      doc[key] = value;
+  });
+};
+
+  Meteor.DiffSequence = DiffSequence;
+};
+
+},{}],36:[function(require,module,exports){
 module.exports=function(Meteor) {
   var _ = Meteor.underscore;
   var Base64 = Meteor.Base64
@@ -8381,11 +15547,129 @@ EJSON.clone = function (v) {
 // then 'base64' would have to use EJSON.newBinary, and 'ejson' would
 // also have to use 'base64'.)
 EJSON.newBinary = Base64.newBinary;
+// Based on json2.js from https://github.com/douglascrockford/JSON-js
+//
+//    json2.js
+//    2012-10-08
+//
+//    Public Domain.
+//
+//    NO WARRANTY EXPRESSED OR IMPLIED. USE AT YOUR OWN RISK.
+
+function quote(string) {
+  return JSON.stringify(string);
+}
+
+var str = function (key, holder, singleIndent, outerIndent, canonical) {
+
+  // Produce a string from holder[key].
+
+  var i;          // The loop counter.
+  var k;          // The member key.
+  var v;          // The member value.
+  var length;
+  var innerIndent = outerIndent;
+  var partial;
+  var value = holder[key];
+
+  // What happens next depends on the value's type.
+
+  switch (typeof value) {
+  case 'string':
+    return quote(value);
+  case 'number':
+    // JSON numbers must be finite. Encode non-finite numbers as null.
+    return isFinite(value) ? String(value) : 'null';
+  case 'boolean':
+    return String(value);
+  // If the type is 'object', we might be dealing with an object or an array or
+  // null.
+  case 'object':
+    // Due to a specification blunder in ECMAScript, typeof null is 'object',
+    // so watch out for that case.
+    if (!value) {
+      return 'null';
+    }
+    // Make an array to hold the partial results of stringifying this object value.
+    innerIndent = outerIndent + singleIndent;
+    partial = [];
+
+    // Is the value an array?
+    if (_.isArray(value) || _.isArguments(value)) {
+
+      // The value is an array. Stringify every element. Use null as a placeholder
+      // for non-JSON values.
+
+      length = value.length;
+      for (i = 0; i < length; i += 1) {
+        partial[i] = str(i, value, singleIndent, innerIndent, canonical) || 'null';
+      }
+
+      // Join all of the elements together, separated with commas, and wrap them in
+      // brackets.
+
+      if (partial.length === 0) {
+        v = '[]';
+      } else if (innerIndent) {
+        v = '[\n' + innerIndent + partial.join(',\n' + innerIndent) + '\n' + outerIndent + ']';
+      } else {
+        v = '[' + partial.join(',') + ']';
+      }
+      return v;
+    }
+
+
+    // Iterate through all of the keys in the object.
+    var keys = _.keys(value);
+    if (canonical)
+      keys = keys.sort();
+    _.each(keys, function (k) {
+      v = str(k, value, singleIndent, innerIndent, canonical);
+      if (v) {
+        partial.push(quote(k) + (innerIndent ? ': ' : ':') + v);
+      }
+    });
+
+
+    // Join all of the member texts together, separated with commas,
+    // and wrap them in braces.
+
+    if (partial.length === 0) {
+      v = '{}';
+    } else if (innerIndent) {
+      v = '{\n' + innerIndent + partial.join(',\n' + innerIndent) + '\n' + outerIndent + '}';
+    } else {
+      v = '{' + partial.join(',') + '}';
+    }
+    return v;
+  }
+}
+
+// If the JSON object does not yet have a stringify method, give it one.
+
+EJSON._canonicalStringify = function (value, options) {
+  // Make a fake root object containing our value under the key of ''.
+  // Return the result of stringifying the value.
+  options = _.extend({
+    indent: "",
+    canonical: false
+  }, options);
+  if (options.indent === true) {
+    options.indent = "  ";
+  } else if (typeof options.indent === 'number') {
+    var newIndent = "";
+    for (var i = 0; i < options.indent; i++) {
+      newIndent += ' ';
+    }
+    options.indent = newIndent;
+  }
+  return str('', {'': value}, options.indent, "", options.canonical);
+};
   Meteor.EJSON = EJSON;
   Meteor.EJSONTest = EJSONTest;
 };
 
-},{}],24:[function(require,module,exports){
+},{}],37:[function(require,module,exports){
 module.exports = function(Meteor) {
   var IDENTITY ,SLICE, Scanner, makeRegexMatcher, getCharacterReference, getComment, getDoctype, getHTMLToken, getTagToken, isLookingAtEndTag, codePointToString, getContent, getRCData;
   var HTML = Meteor.HTML;
@@ -11840,7 +19124,7 @@ var parseAttrs = function (attrs) {
   Meteor.HTMLTools = HTMLTools;
 };
 
-},{}],25:[function(require,module,exports){
+},{}],38:[function(require,module,exports){
 module.exports = function(Meteor) {
   var IDENTITY ,SLICE;
   var _ = Meteor.underscore;
@@ -12451,7 +19735,7 @@ HTML.toText = function (content, textMode) {
   Meteor.HTML = HTML;
 };
 
-},{}],26:[function(require,module,exports){
+},{}],39:[function(require,module,exports){
 module.exports = function(Meteor) {
   var _ = Meteor.underscore;
   var IdMap;
@@ -12535,7 +19819,3642 @@ _.extend(IdMap.prototype, {
   Meteor.IdMap = IdMap;
 };
 
-},{}],27:[function(require,module,exports){
+},{}],40:[function(require,module,exports){
+module.exports = function(Meteor) {
+  var _ = Meteor.underscore;
+  var EJSON = Meteor.EJSON;
+  var IdMap = Meteor.IdMap;
+  var OrderedDict = Meteor.OrderedDict;
+  var Tracker = Meteor.Tracker;
+  var Random = Meteor.Random;
+  var Minimongo;
+  var MinimongoTest;
+  var MinimongoError;
+ 
+  var Package = {};
+// XXX type checking on selectors (graceful error if malformed)
+
+// LocalCollection: a set of documents that supports queries and modifiers.
+
+// Cursor: a specification for a particular subset of documents, w/
+// a defined order, limit, and offset.  creating a Cursor with LocalCollection.find(),
+
+// ObserveHandle: the return value of a live query.
+
+LocalCollection = function (name) {
+  var self = this;
+  self.name = name;
+  // _id -> document (also containing id)
+  self._docs = new LocalCollection._IdMap;
+
+  self._observeQueue = new Meteor._SynchronousQueue();
+
+  self.next_qid = 1; // live query id generator
+
+  // qid -> live query object. keys:
+  //  ordered: bool. ordered queries have addedBefore/movedBefore callbacks.
+  //  results: array (ordered) or object (unordered) of current results
+  //    (aliased with self._docs!)
+  //  resultsSnapshot: snapshot of results. null if not paused.
+  //  cursor: Cursor object for the query.
+  //  selector, sorter, (callbacks): functions
+  self.queries = {};
+
+  // null if not saving originals; an IdMap from id to original document value if
+  // saving originals. See comments before saveOriginals().
+  self._savedOriginals = null;
+
+  // True when observers are paused and we should not send callbacks.
+  self.paused = false;
+};
+
+Minimongo = {};
+
+// Object exported only for unit testing.
+// Use it to export private functions to test in Tinytest.
+MinimongoTest = {};
+
+MinimongoError = function (message) {
+  var e = new Error(message);
+  e.name = "MinimongoError";
+  return e;
+};
+
+
+// options may include sort, skip, limit, reactive
+// sort may be any of these forms:
+//     {a: 1, b: -1}
+//     [["a", "asc"], ["b", "desc"]]
+//     ["a", ["b", "desc"]]
+//   (in the first form you're beholden to key enumeration order in
+//   your javascript VM)
+//
+// reactive: if given, and false, don't register with Tracker (default
+// is true)
+//
+// XXX possibly should support retrieving a subset of fields? and
+// have it be a hint (ignored on the client, when not copying the
+// doc?)
+//
+// XXX sort does not yet support subkeys ('a.b') .. fix that!
+// XXX add one more sort form: "key"
+// XXX tests
+LocalCollection.prototype.find = function (selector, options) {
+  // default syntax for everything is to omit the selector argument.
+  // but if selector is explicitly passed in as false or undefined, we
+  // want a selector that matches nothing.
+  if (arguments.length === 0)
+    selector = {};
+
+  return new LocalCollection.Cursor(this, selector, options);
+};
+
+// don't call this ctor directly.  use LocalCollection.find().
+
+LocalCollection.Cursor = function (collection, selector, options) {
+  var self = this;
+  if (!options) options = {};
+
+  self.collection = collection;
+  self.sorter = null;
+  self.matcher = new Minimongo.Matcher(selector);
+
+  if (LocalCollection._selectorIsId(selector)) {
+    // stash for fast path
+    self._selectorId = selector;
+  } else if (LocalCollection._selectorIsIdPerhapsAsObject(selector)) {
+    // also do the fast path for { _id: idString }
+    self._selectorId = selector._id;
+  } else {
+    self._selectorId = undefined;
+    if (self.matcher.hasGeoQuery() || options.sort) {
+      self.sorter = new Minimongo.Sorter(options.sort || [],
+                                         { matcher: self.matcher });
+    }
+  }
+
+  self.skip = options.skip;
+  self.limit = options.limit;
+  self.fields = options.fields;
+
+  self._projectionFn = LocalCollection._compileProjection(self.fields || {});
+
+  self._transform = LocalCollection.wrapTransform(options.transform);
+
+  // by default, queries register w/ Tracker when it is available.
+  if (typeof Tracker !== "undefined")
+    self.reactive = (options.reactive === undefined) ? true : options.reactive;
+};
+
+// Since we don't actually have a "nextObject" interface, there's really no
+// reason to have a "rewind" interface.  All it did was make multiple calls
+// to fetch/map/forEach return nothing the second time.
+// XXX COMPAT WITH 0.8.1
+LocalCollection.Cursor.prototype.rewind = function () {
+};
+
+LocalCollection.prototype.findOne = function (selector, options) {
+  if (arguments.length === 0)
+    selector = {};
+
+  // NOTE: by setting limit 1 here, we end up using very inefficient
+  // code that recomputes the whole query on each update. The upside is
+  // that when you reactively depend on a findOne you only get
+  // invalidated when the found object changes, not any object in the
+  // collection. Most findOne will be by id, which has a fast path, so
+  // this might not be a big deal. In most cases, invalidation causes
+  // the called to re-query anyway, so this should be a net performance
+  // improvement.
+  options = options || {};
+  options.limit = 1;
+
+  return this.find(selector, options).fetch()[0];
+};
+
+/**
+ * @callback IterationCallback
+ * @param {Object} doc
+ * @param {Number} index
+ */
+/**
+ * @summary Call `callback` once for each matching document, sequentially and synchronously.
+ * @locus Anywhere
+ * @method  forEach
+ * @instance
+ * @memberOf Mongo.Cursor
+ * @param {IterationCallback} callback Function to call. It will be called with three arguments: the document, a 0-based index, and <em>cursor</em> itself.
+ * @param {Any} [thisArg] An object which will be the value of `this` inside `callback`.
+ */
+LocalCollection.Cursor.prototype.forEach = function (callback, thisArg) {
+  var self = this;
+
+  var objects = self._getRawObjects({ordered: true});
+
+  if (self.reactive) {
+    self._depend({
+      addedBefore: true,
+      removed: true,
+      changed: true,
+      movedBefore: true});
+  }
+
+  _.each(objects, function (elt, i) {
+    // This doubles as a clone operation.
+    elt = self._projectionFn(elt);
+
+    if (self._transform)
+      elt = self._transform(elt);
+    callback.call(thisArg, elt, i, self);
+  });
+};
+
+LocalCollection.Cursor.prototype.getTransform = function () {
+  return this._transform;
+};
+
+/**
+ * @summary Map callback over all matching documents.  Returns an Array.
+ * @locus Anywhere
+ * @method map
+ * @instance
+ * @memberOf Mongo.Cursor
+ * @param {IterationCallback} callback Function to call. It will be called with three arguments: the document, a 0-based index, and <em>cursor</em> itself.
+ * @param {Any} [thisArg] An object which will be the value of `this` inside `callback`.
+ */
+LocalCollection.Cursor.prototype.map = function (callback, thisArg) {
+  var self = this;
+  var res = [];
+  self.forEach(function (doc, index) {
+    res.push(callback.call(thisArg, doc, index, self));
+  });
+  return res;
+};
+
+/**
+ * @summary Return all matching documents as an Array.
+ * @memberOf Mongo.Cursor
+ * @method  fetch
+ * @instance
+ * @locus Anywhere
+ * @returns {Object[]}
+ */
+LocalCollection.Cursor.prototype.fetch = function () {
+  var self = this;
+  var res = [];
+  self.forEach(function (doc) {
+    res.push(doc);
+  });
+  return res;
+};
+
+/**
+ * @summary Returns the number of documents that match a query.
+ * @memberOf Mongo.Cursor
+ * @method  count
+ * @instance
+ * @locus Anywhere
+ * @returns {Number}
+ */
+LocalCollection.Cursor.prototype.count = function () {
+  var self = this;
+
+  if (self.reactive)
+    self._depend({added: true, removed: true},
+                 true /* allow the observe to be unordered */);
+
+  return self._getRawObjects({ordered: true}).length;
+};
+
+LocalCollection.Cursor.prototype._publishCursor = function (sub) {
+  var self = this;
+  if (! self.collection.name)
+    throw new Error("Can't publish a cursor from a collection without a name.");
+  var collection = self.collection.name;
+
+  // XXX minimongo should not depend on mongo-livedata!
+  if (! Package.mongo) {
+    throw new Error("Can't publish from Minimongo without the `mongo` package.");
+  }
+
+  return Package.mongo.Mongo.Collection._publishCursor(self, sub, collection);
+};
+
+LocalCollection.Cursor.prototype._getCollectionName = function () {
+  var self = this;
+  return self.collection.name;
+};
+
+LocalCollection._observeChangesCallbacksAreOrdered = function (callbacks) {
+  if (callbacks.added && callbacks.addedBefore)
+    throw new Error("Please specify only one of added() and addedBefore()");
+  return !!(callbacks.addedBefore || callbacks.movedBefore);
+};
+
+LocalCollection._observeCallbacksAreOrdered = function (callbacks) {
+  if (callbacks.addedAt && callbacks.added)
+    throw new Error("Please specify only one of added() and addedAt()");
+  if (callbacks.changedAt && callbacks.changed)
+    throw new Error("Please specify only one of changed() and changedAt()");
+  if (callbacks.removed && callbacks.removedAt)
+    throw new Error("Please specify only one of removed() and removedAt()");
+
+  return !!(callbacks.addedAt || callbacks.movedTo || callbacks.changedAt
+            || callbacks.removedAt);
+};
+
+// the handle that comes back from observe.
+LocalCollection.ObserveHandle = function () {};
+
+// options to contain:
+//  * callbacks for observe():
+//    - addedAt (document, atIndex)
+//    - added (document)
+//    - changedAt (newDocument, oldDocument, atIndex)
+//    - changed (newDocument, oldDocument)
+//    - removedAt (document, atIndex)
+//    - removed (document)
+//    - movedTo (document, oldIndex, newIndex)
+//
+// attributes available on returned query handle:
+//  * stop(): end updates
+//  * collection: the collection this query is querying
+//
+// iff x is a returned query handle, (x instanceof
+// LocalCollection.ObserveHandle) is true
+//
+// initial results delivered through added callback
+// XXX maybe callbacks should take a list of objects, to expose transactions?
+// XXX maybe support field limiting (to limit what you're notified on)
+
+_.extend(LocalCollection.Cursor.prototype, {
+  /**
+   * @summary Watch a query.  Receive callbacks as the result set changes.
+   * @locus Anywhere
+   * @memberOf Mongo.Cursor
+   * @instance
+   * @param {Object} callbacks Functions to call to deliver the result set as it changes
+   */
+  observe: function (options) {
+    var self = this;
+    return LocalCollection._observeFromObserveChanges(self, options);
+  },
+
+  /**
+   * @summary Watch a query.  Receive callbacks as the result set changes.  Only the differences between the old and new documents are passed to the callbacks.
+   * @locus Anywhere
+   * @memberOf Mongo.Cursor
+   * @instance
+   * @param {Object} callbacks Functions to call to deliver the result set as it changes
+   */
+  observeChanges: function (options) {
+    var self = this;
+
+    var ordered = LocalCollection._observeChangesCallbacksAreOrdered(options);
+
+    // there are several places that assume you aren't combining skip/limit with
+    // unordered observe.  eg, update's EJSON.clone, and the "there are several"
+    // comment in _modifyAndNotify
+    // XXX allow skip/limit with unordered observe
+    if (!options._allow_unordered && !ordered && (self.skip || self.limit))
+      throw new Error("must use ordered observe (ie, 'addedBefore' instead of 'added') with skip or limit");
+
+    if (self.fields && (self.fields._id === 0 || self.fields._id === false))
+      throw Error("You may not observe a cursor with {fields: {_id: 0}}");
+
+    var query = {
+      matcher: self.matcher, // not fast pathed
+      sorter: ordered && self.sorter,
+      distances: (
+        self.matcher.hasGeoQuery() && ordered && new LocalCollection._IdMap),
+      resultsSnapshot: null,
+      ordered: ordered,
+      cursor: self,
+      projectionFn: self._projectionFn
+    };
+    var qid;
+
+    // Non-reactive queries call added[Before] and then never call anything
+    // else.
+    if (self.reactive) {
+      qid = self.collection.next_qid++;
+      self.collection.queries[qid] = query;
+    }
+    query.results = self._getRawObjects({
+      ordered: ordered, distances: query.distances});
+    if (self.collection.paused)
+      query.resultsSnapshot = (ordered ? [] : new LocalCollection._IdMap);
+
+    // wrap callbacks we were passed. callbacks only fire when not paused and
+    // are never undefined
+    // Filters out blacklisted fields according to cursor's projection.
+    // XXX wrong place for this?
+
+    // furthermore, callbacks enqueue until the operation we're working on is
+    // done.
+    var wrapCallback = function (f) {
+      if (!f)
+        return function () {};
+      return function (/*args*/) {
+        var context = this;
+        var args = arguments;
+
+        if (self.collection.paused)
+          return;
+
+        self.collection._observeQueue.queueTask(function () {
+          f.apply(context, args);
+        });
+      };
+    };
+    query.added = wrapCallback(options.added);
+    query.changed = wrapCallback(options.changed);
+    query.removed = wrapCallback(options.removed);
+    if (ordered) {
+      query.addedBefore = wrapCallback(options.addedBefore);
+      query.movedBefore = wrapCallback(options.movedBefore);
+    }
+
+    if (!options._suppress_initial && !self.collection.paused) {
+      // XXX unify ordered and unordered interface
+      var each = ordered
+            ? _.bind(_.each, null, query.results)
+            : _.bind(query.results.forEach, query.results);
+      each(function (doc) {
+        var fields = EJSON.clone(doc);
+
+        delete fields._id;
+        if (ordered)
+          query.addedBefore(doc._id, self._projectionFn(fields), null);
+        query.added(doc._id, self._projectionFn(fields));
+      });
+    }
+
+    var handle = new LocalCollection.ObserveHandle;
+    _.extend(handle, {
+      collection: self.collection,
+      stop: function () {
+        if (self.reactive)
+          delete self.collection.queries[qid];
+      }
+    });
+
+    if (self.reactive && Tracker.active) {
+      // XXX in many cases, the same observe will be recreated when
+      // the current autorun is rerun.  we could save work by
+      // letting it linger across rerun and potentially get
+      // repurposed if the same observe is performed, using logic
+      // similar to that of Meteor.subscribe.
+      Tracker.onInvalidate(function () {
+        handle.stop();
+      });
+    }
+    // run the observe callbacks resulting from the initial contents
+    // before we leave the observe.
+    self.collection._observeQueue.drain();
+
+    return handle;
+  }
+});
+
+// Returns a collection of matching objects, but doesn't deep copy them.
+//
+// If ordered is set, returns a sorted array, respecting sorter, skip, and limit
+// properties of the query.  if sorter is falsey, no sort -- you get the natural
+// order.
+//
+// If ordered is not set, returns an object mapping from ID to doc (sorter, skip
+// and limit should not be set).
+//
+// If ordered is set and this cursor is a $near geoquery, then this function
+// will use an _IdMap to track each distance from the $near argument point in
+// order to use it as a sort key. If an _IdMap is passed in the 'distances'
+// argument, this function will clear it and use it for this purpose (otherwise
+// it will just create its own _IdMap). The observeChanges implementation uses
+// this to remember the distances after this function returns.
+LocalCollection.Cursor.prototype._getRawObjects = function (options) {
+  var self = this;
+  options = options || {};
+
+  // XXX use OrderedDict instead of array, and make IdMap and OrderedDict
+  // compatible
+  var results = options.ordered ? [] : new LocalCollection._IdMap;
+
+  // fast path for single ID value
+  if (self._selectorId !== undefined) {
+    // If you have non-zero skip and ask for a single id, you get
+    // nothing. This is so it matches the behavior of the '{_id: foo}'
+    // path.
+    if (self.skip)
+      return results;
+
+    var selectedDoc = self.collection._docs.get(self._selectorId);
+    if (selectedDoc) {
+      if (options.ordered)
+        results.push(selectedDoc);
+      else
+        results.set(self._selectorId, selectedDoc);
+    }
+    return results;
+  }
+
+  // slow path for arbitrary selector, sort, skip, limit
+
+  // in the observeChanges case, distances is actually part of the "query" (ie,
+  // live results set) object.  in other cases, distances is only used inside
+  // this function.
+  var distances;
+  if (self.matcher.hasGeoQuery() && options.ordered) {
+    if (options.distances) {
+      distances = options.distances;
+      distances.clear();
+    } else {
+      distances = new LocalCollection._IdMap();
+    }
+  }
+
+  self.collection._docs.forEach(function (doc, id) {
+    var matchResult = self.matcher.documentMatches(doc);
+    if (matchResult.result) {
+      if (options.ordered) {
+        results.push(doc);
+        if (distances && matchResult.distance !== undefined)
+          distances.set(id, matchResult.distance);
+      } else {
+        results.set(id, doc);
+      }
+    }
+    // Fast path for limited unsorted queries.
+    // XXX 'length' check here seems wrong for ordered
+    if (self.limit && !self.skip && !self.sorter &&
+        results.length === self.limit)
+      return false;  // break
+    return true;  // continue
+  });
+
+  if (!options.ordered)
+    return results;
+
+  if (self.sorter) {
+    var comparator = self.sorter.getComparator({distances: distances});
+    results.sort(comparator);
+  }
+
+  var idx_start = self.skip || 0;
+  var idx_end = self.limit ? (self.limit + idx_start) : results.length;
+  return results.slice(idx_start, idx_end);
+};
+
+// XXX Maybe we need a version of observe that just calls a callback if
+// anything changed.
+LocalCollection.Cursor.prototype._depend = function (changers, _allow_unordered) {
+  var self = this;
+
+  if (Tracker.active) {
+    var v = new Tracker.Dependency;
+    v.depend();
+    var notifyChange = _.bind(v.changed, v);
+
+    var options = {
+      _suppress_initial: true,
+      _allow_unordered: _allow_unordered
+    };
+    _.each(['added', 'changed', 'removed', 'addedBefore', 'movedBefore'],
+           function (fnName) {
+             if (changers[fnName])
+               options[fnName] = notifyChange;
+           });
+
+    // observeChanges will stop() when this computation is invalidated
+    self.observeChanges(options);
+  }
+};
+
+// XXX enforce rule that field names can't start with '$' or contain '.'
+// (real mongodb does in fact enforce this)
+// XXX possibly enforce that 'undefined' does not appear (we assume
+// this in our handling of null and $exists)
+LocalCollection.prototype.insert = function (doc, callback) {
+  var self = this;
+  doc = EJSON.clone(doc);
+
+  if (!_.has(doc, '_id')) {
+    // if you really want to use ObjectIDs, set this global.
+    // Mongo.Collection specifies its own ids and does not use this code.
+    doc._id = LocalCollection._useOID ? new MongoID.ObjectID()
+                                      : Random.id();
+  }
+  var id = doc._id;
+
+  if (self._docs.has(id))
+    throw MinimongoError("Duplicate _id '" + id + "'");
+
+  self._saveOriginal(id, undefined);
+  self._docs.set(id, doc);
+
+  var queriesToRecompute = [];
+  // trigger live queries that match
+  for (var qid in self.queries) {
+    var query = self.queries[qid];
+    var matchResult = query.matcher.documentMatches(doc);
+    if (matchResult.result) {
+      if (query.distances && matchResult.distance !== undefined)
+        query.distances.set(id, matchResult.distance);
+      if (query.cursor.skip || query.cursor.limit)
+        queriesToRecompute.push(qid);
+      else
+        LocalCollection._insertInResults(query, doc);
+    }
+  }
+
+  _.each(queriesToRecompute, function (qid) {
+    if (self.queries[qid])
+      self._recomputeResults(self.queries[qid]);
+  });
+  self._observeQueue.drain();
+
+  // Defer because the caller likely doesn't expect the callback to be run
+  // immediately.
+  if (callback)
+    Meteor.defer(function () {
+      callback(null, id);
+    });
+  return id;
+};
+
+// Iterates over a subset of documents that could match selector; calls
+// f(doc, id) on each of them.  Specifically, if selector specifies
+// specific _id's, it only looks at those.  doc is *not* cloned: it is the
+// same object that is in _docs.
+LocalCollection.prototype._eachPossiblyMatchingDoc = function (selector, f) {
+  var self = this;
+  var specificIds = LocalCollection._idsMatchedBySelector(selector);
+  if (specificIds) {
+    for (var i = 0; i < specificIds.length; ++i) {
+      var id = specificIds[i];
+      var doc = self._docs.get(id);
+      if (doc) {
+        var breakIfFalse = f(doc, id);
+        if (breakIfFalse === false)
+          break;
+      }
+    }
+  } else {
+    self._docs.forEach(f);
+  }
+};
+
+LocalCollection.prototype.remove = function (selector, callback) {
+  var self = this;
+
+  // Easy special case: if we're not calling observeChanges callbacks and we're
+  // not saving originals and we got asked to remove everything, then just empty
+  // everything directly.
+  if (self.paused && !self._savedOriginals && EJSON.equals(selector, {})) {
+    var result = self._docs.size();
+    self._docs.clear();
+    _.each(self.queries, function (query) {
+      if (query.ordered) {
+        query.results = [];
+      } else {
+        query.results.clear();
+      }
+    });
+    if (callback) {
+      Meteor.defer(function () {
+        callback(null, result);
+      });
+    }
+    return result;
+  }
+
+  var matcher = new Minimongo.Matcher(selector);
+  var remove = [];
+  self._eachPossiblyMatchingDoc(selector, function (doc, id) {
+    if (matcher.documentMatches(doc).result)
+      remove.push(id);
+  });
+
+  var queriesToRecompute = [];
+  var queryRemove = [];
+  for (var i = 0; i < remove.length; i++) {
+    var removeId = remove[i];
+    var removeDoc = self._docs.get(removeId);
+    _.each(self.queries, function (query, qid) {
+      if (query.matcher.documentMatches(removeDoc).result) {
+        if (query.cursor.skip || query.cursor.limit)
+          queriesToRecompute.push(qid);
+        else
+          queryRemove.push({qid: qid, doc: removeDoc});
+      }
+    });
+    self._saveOriginal(removeId, removeDoc);
+    self._docs.remove(removeId);
+  }
+
+  // run live query callbacks _after_ we've removed the documents.
+  _.each(queryRemove, function (remove) {
+    var query = self.queries[remove.qid];
+    if (query) {
+      query.distances && query.distances.remove(remove.doc._id);
+      LocalCollection._removeFromResults(query, remove.doc);
+    }
+  });
+  _.each(queriesToRecompute, function (qid) {
+    var query = self.queries[qid];
+    if (query)
+      self._recomputeResults(query);
+  });
+  self._observeQueue.drain();
+  result = remove.length;
+  if (callback)
+    Meteor.defer(function () {
+      callback(null, result);
+    });
+  return result;
+};
+
+// XXX atomicity: if multi is true, and one modification fails, do
+// we rollback the whole operation, or what?
+LocalCollection.prototype.update = function (selector, mod, options, callback) {
+  var self = this;
+  if (! callback && options instanceof Function) {
+    callback = options;
+    options = null;
+  }
+  if (!options) options = {};
+
+  var matcher = new Minimongo.Matcher(selector);
+
+  // Save the original results of any query that we might need to
+  // _recomputeResults on, because _modifyAndNotify will mutate the objects in
+  // it. (We don't need to save the original results of paused queries because
+  // they already have a resultsSnapshot and we won't be diffing in
+  // _recomputeResults.)
+  var qidToOriginalResults = {};
+  // We should only clone each document once, even if it appears in multiple queries
+  var docMap = new LocalCollection._IdMap;
+  var idsMatchedBySelector = LocalCollection._idsMatchedBySelector(selector);
+
+  _.each(self.queries, function (query, qid) {
+    if ((query.cursor.skip || query.cursor.limit) && ! self.paused) {
+      // Catch the case of a reactive `count()` on a cursor with skip
+      // or limit, which registers an unordered observe. This is a
+      // pretty rare case, so we just clone the entire result set with
+      // no optimizations for documents that appear in these result
+      // sets and other queries.
+      if (query.results instanceof LocalCollection._IdMap) {
+        qidToOriginalResults[qid] = query.results.clone();
+        return;
+      }
+
+      if (!(query.results instanceof Array)) {
+        throw new Error("Assertion failed: query.results not an array");
+      }
+
+      // Clones a document to be stored in `qidToOriginalResults`
+      // because it may be modified before the new and old result sets
+      // are diffed. But if we know exactly which document IDs we're
+      // going to modify, then we only need to clone those.
+      var memoizedCloneIfNeeded = function(doc) {
+        if (docMap.has(doc._id)) {
+          return docMap.get(doc._id);
+        } else {
+          var docToMemoize;
+
+          if (idsMatchedBySelector && !_.any(idsMatchedBySelector, function(id) {
+            return EJSON.equals(id, doc._id);
+          })) {
+            docToMemoize = doc;
+          } else {
+            docToMemoize = EJSON.clone(doc);
+          }
+
+          docMap.set(doc._id, docToMemoize);
+          return docToMemoize;
+        }
+      };
+
+      qidToOriginalResults[qid] = query.results.map(memoizedCloneIfNeeded);
+    }
+  });
+  var recomputeQids = {};
+
+  var updateCount = 0;
+
+  self._eachPossiblyMatchingDoc(selector, function (doc, id) {
+    var queryResult = matcher.documentMatches(doc);
+    if (queryResult.result) {
+      // XXX Should we save the original even if mod ends up being a no-op?
+      self._saveOriginal(id, doc);
+      self._modifyAndNotify(doc, mod, recomputeQids, queryResult.arrayIndices);
+      ++updateCount;
+      if (!options.multi)
+        return false;  // break
+    }
+    return true;
+  });
+
+  _.each(recomputeQids, function (dummy, qid) {
+    var query = self.queries[qid];
+    if (query)
+      self._recomputeResults(query, qidToOriginalResults[qid]);
+  });
+  self._observeQueue.drain();
+
+  // If we are doing an upsert, and we didn't modify any documents yet, then
+  // it's time to do an insert. Figure out what document we are inserting, and
+  // generate an id for it.
+  var insertedId;
+  if (updateCount === 0 && options.upsert) {
+    var newDoc = LocalCollection._removeDollarOperators(selector);
+    LocalCollection._modify(newDoc, mod, {isInsert: true});
+    if (! newDoc._id && options.insertedId)
+      newDoc._id = options.insertedId;
+    insertedId = self.insert(newDoc);
+    updateCount = 1;
+  }
+
+  // Return the number of affected documents, or in the upsert case, an object
+  // containing the number of affected docs and the id of the doc that was
+  // inserted, if any.
+  var result;
+  if (options._returnObject) {
+    result = {
+      numberAffected: updateCount
+    };
+    if (insertedId !== undefined)
+      result.insertedId = insertedId;
+  } else {
+    result = updateCount;
+  }
+
+  if (callback)
+    Meteor.defer(function () {
+      callback(null, result);
+    });
+  return result;
+};
+
+// A convenience wrapper on update. LocalCollection.upsert(sel, mod) is
+// equivalent to LocalCollection.update(sel, mod, { upsert: true, _returnObject:
+// true }).
+LocalCollection.prototype.upsert = function (selector, mod, options, callback) {
+  var self = this;
+  if (! callback && typeof options === "function") {
+    callback = options;
+    options = {};
+  }
+  return self.update(selector, mod, _.extend({}, options, {
+    upsert: true,
+    _returnObject: true
+  }), callback);
+};
+
+LocalCollection.prototype._modifyAndNotify = function (
+    doc, mod, recomputeQids, arrayIndices) {
+  var self = this;
+
+  var matched_before = {};
+  for (var qid in self.queries) {
+    var query = self.queries[qid];
+    if (query.ordered) {
+      matched_before[qid] = query.matcher.documentMatches(doc).result;
+    } else {
+      // Because we don't support skip or limit (yet) in unordered queries, we
+      // can just do a direct lookup.
+      matched_before[qid] = query.results.has(doc._id);
+    }
+  }
+
+  var old_doc = EJSON.clone(doc);
+
+  LocalCollection._modify(doc, mod, {arrayIndices: arrayIndices});
+
+  for (qid in self.queries) {
+    query = self.queries[qid];
+    var before = matched_before[qid];
+    var afterMatch = query.matcher.documentMatches(doc);
+    var after = afterMatch.result;
+    if (after && query.distances && afterMatch.distance !== undefined)
+      query.distances.set(doc._id, afterMatch.distance);
+
+    if (query.cursor.skip || query.cursor.limit) {
+      // We need to recompute any query where the doc may have been in the
+      // cursor's window either before or after the update. (Note that if skip
+      // or limit is set, "before" and "after" being true do not necessarily
+      // mean that the document is in the cursor's output after skip/limit is
+      // applied... but if they are false, then the document definitely is NOT
+      // in the output. So it's safe to skip recompute if neither before or
+      // after are true.)
+      if (before || after)
+        recomputeQids[qid] = true;
+    } else if (before && !after) {
+      LocalCollection._removeFromResults(query, doc);
+    } else if (!before && after) {
+      LocalCollection._insertInResults(query, doc);
+    } else if (before && after) {
+      LocalCollection._updateInResults(query, doc, old_doc);
+    }
+  }
+};
+
+// XXX the sorted-query logic below is laughably inefficient. we'll
+// need to come up with a better datastructure for this.
+//
+// XXX the logic for observing with a skip or a limit is even more
+// laughably inefficient. we recompute the whole results every time!
+
+LocalCollection._insertInResults = function (query, doc) {
+  var fields = EJSON.clone(doc);
+  delete fields._id;
+  if (query.ordered) {
+    if (!query.sorter) {
+      query.addedBefore(doc._id, query.projectionFn(fields), null);
+      query.results.push(doc);
+    } else {
+      var i = LocalCollection._insertInSortedList(
+        query.sorter.getComparator({distances: query.distances}),
+        query.results, doc);
+      var next = query.results[i+1];
+      if (next)
+        next = next._id;
+      else
+        next = null;
+      query.addedBefore(doc._id, query.projectionFn(fields), next);
+    }
+    query.added(doc._id, query.projectionFn(fields));
+  } else {
+    query.added(doc._id, query.projectionFn(fields));
+    query.results.set(doc._id, doc);
+  }
+};
+
+LocalCollection._removeFromResults = function (query, doc) {
+  if (query.ordered) {
+    var i = LocalCollection._findInOrderedResults(query, doc);
+    query.removed(doc._id);
+    query.results.splice(i, 1);
+  } else {
+    var id = doc._id;  // in case callback mutates doc
+    query.removed(doc._id);
+    query.results.remove(id);
+  }
+};
+
+LocalCollection._updateInResults = function (query, doc, old_doc) {
+  if (!EJSON.equals(doc._id, old_doc._id))
+    throw new Error("Can't change a doc's _id while updating");
+  var projectionFn = query.projectionFn;
+  var changedFields = DiffSequence.makeChangedFields(
+    projectionFn(doc), projectionFn(old_doc));
+
+  if (!query.ordered) {
+    if (!_.isEmpty(changedFields)) {
+      query.changed(doc._id, changedFields);
+      query.results.set(doc._id, doc);
+    }
+    return;
+  }
+
+  var orig_idx = LocalCollection._findInOrderedResults(query, doc);
+
+  if (!_.isEmpty(changedFields))
+    query.changed(doc._id, changedFields);
+  if (!query.sorter)
+    return;
+
+  // just take it out and put it back in again, and see if the index
+  // changes
+  query.results.splice(orig_idx, 1);
+  var new_idx = LocalCollection._insertInSortedList(
+    query.sorter.getComparator({distances: query.distances}),
+    query.results, doc);
+  if (orig_idx !== new_idx) {
+    var next = query.results[new_idx+1];
+    if (next)
+      next = next._id;
+    else
+      next = null;
+    query.movedBefore && query.movedBefore(doc._id, next);
+  }
+};
+
+// Recomputes the results of a query and runs observe callbacks for the
+// difference between the previous results and the current results (unless
+// paused). Used for skip/limit queries.
+//
+// When this is used by insert or remove, it can just use query.results for the
+// old results (and there's no need to pass in oldResults), because these
+// operations don't mutate the documents in the collection. Update needs to pass
+// in an oldResults which was deep-copied before the modifier was applied.
+//
+// oldResults is guaranteed to be ignored if the query is not paused.
+LocalCollection.prototype._recomputeResults = function (query, oldResults) {
+  var self = this;
+  if (! self.paused && ! oldResults)
+    oldResults = query.results;
+  if (query.distances)
+    query.distances.clear();
+  query.results = query.cursor._getRawObjects({
+    ordered: query.ordered, distances: query.distances});
+
+  if (! self.paused) {
+    LocalCollection._diffQueryChanges(
+      query.ordered, oldResults, query.results, query,
+      { projectionFn: query.projectionFn });
+  }
+};
+
+
+LocalCollection._findInOrderedResults = function (query, doc) {
+  if (!query.ordered)
+    throw new Error("Can't call _findInOrderedResults on unordered query");
+  for (var i = 0; i < query.results.length; i++)
+    if (query.results[i] === doc)
+      return i;
+  throw Error("object missing from query");
+};
+
+// This binary search puts a value between any equal values, and the first
+// lesser value.
+LocalCollection._binarySearch = function (cmp, array, value) {
+  var first = 0, rangeLength = array.length;
+
+  while (rangeLength > 0) {
+    var halfRange = Math.floor(rangeLength/2);
+    if (cmp(value, array[first + halfRange]) >= 0) {
+      first += halfRange + 1;
+      rangeLength -= halfRange + 1;
+    } else {
+      rangeLength = halfRange;
+    }
+  }
+  return first;
+};
+
+LocalCollection._insertInSortedList = function (cmp, array, value) {
+  if (array.length === 0) {
+    array.push(value);
+    return 0;
+  }
+
+  var idx = LocalCollection._binarySearch(cmp, array, value);
+  array.splice(idx, 0, value);
+  return idx;
+};
+
+// To track what documents are affected by a piece of code, call saveOriginals()
+// before it and retrieveOriginals() after it. retrieveOriginals returns an
+// object whose keys are the ids of the documents that were affected since the
+// call to saveOriginals(), and the values are equal to the document's contents
+// at the time of saveOriginals. (In the case of an inserted document, undefined
+// is the value.) You must alternate between calls to saveOriginals() and
+// retrieveOriginals().
+LocalCollection.prototype.saveOriginals = function () {
+  var self = this;
+  if (self._savedOriginals)
+    throw new Error("Called saveOriginals twice without retrieveOriginals");
+  self._savedOriginals = new LocalCollection._IdMap;
+};
+LocalCollection.prototype.retrieveOriginals = function () {
+  var self = this;
+  if (!self._savedOriginals)
+    throw new Error("Called retrieveOriginals without saveOriginals");
+
+  var originals = self._savedOriginals;
+  self._savedOriginals = null;
+  return originals;
+};
+
+LocalCollection.prototype._saveOriginal = function (id, doc) {
+  var self = this;
+  // Are we even trying to save originals?
+  if (!self._savedOriginals)
+    return;
+  // Have we previously mutated the original (and so 'doc' is not actually
+  // original)?  (Note the 'has' check rather than truth: we store undefined
+  // here for inserted docs!)
+  if (self._savedOriginals.has(id))
+    return;
+  self._savedOriginals.set(id, EJSON.clone(doc));
+};
+
+// Pause the observers. No callbacks from observers will fire until
+// 'resumeObservers' is called.
+LocalCollection.prototype.pauseObservers = function () {
+  // No-op if already paused.
+  if (this.paused)
+    return;
+
+  // Set the 'paused' flag such that new observer messages don't fire.
+  this.paused = true;
+
+  // Take a snapshot of the query results for each query.
+  for (var qid in this.queries) {
+    var query = this.queries[qid];
+
+    query.resultsSnapshot = EJSON.clone(query.results);
+  }
+};
+
+// Resume the observers. Observers immediately receive change
+// notifications to bring them to the current state of the
+// database. Note that this is not just replaying all the changes that
+// happened during the pause, it is a smarter 'coalesced' diff.
+LocalCollection.prototype.resumeObservers = function () {
+  var self = this;
+  // No-op if not paused.
+  if (!this.paused)
+    return;
+
+  // Unset the 'paused' flag. Make sure to do this first, otherwise
+  // observer methods won't actually fire when we trigger them.
+  this.paused = false;
+
+  for (var qid in this.queries) {
+    var query = self.queries[qid];
+    // Diff the current results against the snapshot and send to observers.
+    // pass the query object for its observer callbacks.
+    LocalCollection._diffQueryChanges(
+      query.ordered, query.resultsSnapshot, query.results, query,
+      { projectionFn: query.projectionFn });
+    query.resultsSnapshot = null;
+  }
+  self._observeQueue.drain();
+};
+
+// Wrap a transform function to return objects that have the _id field
+// of the untransformed document. This ensures that subsystems such as
+// the observe-sequence package that call `observe` can keep track of
+// the documents identities.
+//
+// - Require that it returns objects
+// - If the return value has an _id field, verify that it matches the
+//   original _id field
+// - If the return value doesn't have an _id field, add it back.
+LocalCollection.wrapTransform = function (transform) {
+  if (! transform)
+    return null;
+
+  // No need to doubly-wrap transforms.
+  if (transform.__wrappedTransform__)
+    return transform;
+
+  var wrapped = function (doc) {
+    if (!_.has(doc, '_id')) {
+      // XXX do we ever have a transform on the oplog's collection? because that
+      // collection has no _id.
+      throw new Error("can only transform documents with _id");
+    }
+
+    var id = doc._id;
+    // XXX consider making tracker a weak dependency and checking Package.tracker here
+    var transformed = Tracker.nonreactive(function () {
+      return transform(doc);
+    });
+
+    if (!isPlainObject(transformed)) {
+      throw new Error("transform must return object");
+    }
+
+    if (_.has(transformed, '_id')) {
+      if (!EJSON.equals(transformed._id, id)) {
+        throw new Error("transformed document can't have different _id");
+      }
+    } else {
+      transformed._id = id;
+    }
+    return transformed;
+  };
+  wrapped.__wrappedTransform__ = true;
+  return wrapped;
+};
+// Like _.isArray, but doesn't regard polyfilled Uint8Arrays on old browsers as
+// arrays.
+// XXX maybe this should be EJSON.isArray
+isArray = function (x) {
+  return _.isArray(x) && !EJSON.isBinary(x);
+};
+
+// XXX maybe this should be EJSON.isObject, though EJSON doesn't know about
+// RegExp
+// XXX note that _type(undefined) === 3!!!!
+isPlainObject = LocalCollection._isPlainObject = function (x) {
+  return x && LocalCollection._f._type(x) === 3;
+};
+
+isIndexable = function (x) {
+  return isArray(x) || isPlainObject(x);
+};
+
+// Returns true if this is an object with at least one key and all keys begin
+// with $.  Unless inconsistentOK is set, throws if some keys begin with $ and
+// others don't.
+isOperatorObject = function (valueSelector, inconsistentOK) {
+  if (!isPlainObject(valueSelector))
+    return false;
+
+  var theseAreOperators = undefined;
+  _.each(valueSelector, function (value, selKey) {
+    var thisIsOperator = selKey.substr(0, 1) === '$';
+    if (theseAreOperators === undefined) {
+      theseAreOperators = thisIsOperator;
+    } else if (theseAreOperators !== thisIsOperator) {
+      if (!inconsistentOK)
+        throw new Error("Inconsistent operator: " +
+                        JSON.stringify(valueSelector));
+      theseAreOperators = false;
+    }
+  });
+  return !!theseAreOperators;  // {} has no operators
+};
+
+
+// string can be converted to integer
+isNumericKey = function (s) {
+  return /^[0-9]+$/.test(s);
+};
+// The minimongo selector compiler!
+
+// Terminology:
+//  - a "selector" is the EJSON object representing a selector
+//  - a "matcher" is its compiled form (whether a full Minimongo.Matcher
+//    object or one of the component lambdas that matches parts of it)
+//  - a "result object" is an object with a "result" field and maybe
+//    distance and arrayIndices.
+//  - a "branched value" is an object with a "value" field and maybe
+//    "dontIterate" and "arrayIndices".
+//  - a "document" is a top-level object that can be stored in a collection.
+//  - a "lookup function" is a function that takes in a document and returns
+//    an array of "branched values".
+//  - a "branched matcher" maps from an array of branched values to a result
+//    object.
+//  - an "element matcher" maps from a single value to a bool.
+
+// Main entry point.
+//   var matcher = new Minimongo.Matcher({a: {$gt: 5}});
+//   if (matcher.documentMatches({a: 7})) ...
+Minimongo.Matcher = function (selector) {
+  var self = this;
+  // A set (object mapping string -> *) of all of the document paths looked
+  // at by the selector. Also includes the empty string if it may look at any
+  // path (eg, $where).
+  self._paths = {};
+  // Set to true if compilation finds a $near.
+  self._hasGeoQuery = false;
+  // Set to true if compilation finds a $where.
+  self._hasWhere = false;
+  // Set to false if compilation finds anything other than a simple equality or
+  // one or more of '$gt', '$gte', '$lt', '$lte', '$ne', '$in', '$nin' used with
+  // scalars as operands.
+  self._isSimple = true;
+  // Set to a dummy document which always matches this Matcher. Or set to null
+  // if such document is too hard to find.
+  self._matchingDocument = undefined;
+  // A clone of the original selector. It may just be a function if the user
+  // passed in a function; otherwise is definitely an object (eg, IDs are
+  // translated into {_id: ID} first. Used by canBecomeTrueByModifier and
+  // Sorter._useWithMatcher.
+  self._selector = null;
+  self._docMatcher = self._compileSelector(selector);
+};
+
+_.extend(Minimongo.Matcher.prototype, {
+  documentMatches: function (doc) {
+    if (!doc || typeof doc !== "object") {
+      throw Error("documentMatches needs a document");
+    }
+    return this._docMatcher(doc);
+  },
+  hasGeoQuery: function () {
+    return this._hasGeoQuery;
+  },
+  hasWhere: function () {
+    return this._hasWhere;
+  },
+  isSimple: function () {
+    return this._isSimple;
+  },
+
+  // Given a selector, return a function that takes one argument, a
+  // document. It returns a result object.
+  _compileSelector: function (selector) {
+    var self = this;
+    // you can pass a literal function instead of a selector
+    if (selector instanceof Function) {
+      self._isSimple = false;
+      self._selector = selector;
+      self._recordPathUsed('');
+      return function (doc) {
+        return {result: !!selector.call(doc)};
+      };
+    }
+
+    // shorthand -- scalars match _id
+    if (LocalCollection._selectorIsId(selector)) {
+      self._selector = {_id: selector};
+      self._recordPathUsed('_id');
+      return function (doc) {
+        return {result: EJSON.equals(doc._id, selector)};
+      };
+    }
+
+    // protect against dangerous selectors.  falsey and {_id: falsey} are both
+    // likely programmer error, and not what you want, particularly for
+    // destructive operations.
+    if (!selector || (('_id' in selector) && !selector._id)) {
+      self._isSimple = false;
+      return nothingMatcher;
+    }
+
+    // Top level can't be an array or true or binary.
+    if (typeof(selector) === 'boolean' || isArray(selector) ||
+        EJSON.isBinary(selector))
+      throw new Error("Invalid selector: " + selector);
+
+    self._selector = EJSON.clone(selector);
+    return compileDocumentSelector(selector, self, {isRoot: true});
+  },
+  _recordPathUsed: function (path) {
+    this._paths[path] = true;
+  },
+  // Returns a list of key paths the given selector is looking for. It includes
+  // the empty string if there is a $where.
+  _getPaths: function () {
+    return _.keys(this._paths);
+  }
+});
+
+
+// Takes in a selector that could match a full document (eg, the original
+// selector). Returns a function mapping document->result object.
+//
+// matcher is the Matcher object we are compiling.
+//
+// If this is the root document selector (ie, not wrapped in $and or the like),
+// then isRoot is true. (This is used by $near.)
+var compileDocumentSelector = function (docSelector, matcher, options) {
+  options = options || {};
+  var docMatchers = [];
+  _.each(docSelector, function (subSelector, key) {
+    if (key.substr(0, 1) === '$') {
+      // Outer operators are either logical operators (they recurse back into
+      // this function), or $where.
+      if (!_.has(LOGICAL_OPERATORS, key))
+        throw new Error("Unrecognized logical operator: " + key);
+      matcher._isSimple = false;
+      docMatchers.push(LOGICAL_OPERATORS[key](subSelector, matcher,
+                                              options.inElemMatch));
+    } else {
+      // Record this path, but only if we aren't in an elemMatcher, since in an
+      // elemMatch this is a path inside an object in an array, not in the doc
+      // root.
+      if (!options.inElemMatch)
+        matcher._recordPathUsed(key);
+      var lookUpByIndex = makeLookupFunction(key);
+      var valueMatcher =
+        compileValueSelector(subSelector, matcher, options.isRoot);
+      docMatchers.push(function (doc) {
+        var branchValues = lookUpByIndex(doc);
+        return valueMatcher(branchValues);
+      });
+    }
+  });
+
+  return andDocumentMatchers(docMatchers);
+};
+
+// Takes in a selector that could match a key-indexed value in a document; eg,
+// {$gt: 5, $lt: 9}, or a regular expression, or any non-expression object (to
+// indicate equality).  Returns a branched matcher: a function mapping
+// [branched value]->result object.
+var compileValueSelector = function (valueSelector, matcher, isRoot) {
+  if (valueSelector instanceof RegExp) {
+    matcher._isSimple = false;
+    return convertElementMatcherToBranchedMatcher(
+      regexpElementMatcher(valueSelector));
+  } else if (isOperatorObject(valueSelector)) {
+    return operatorBranchedMatcher(valueSelector, matcher, isRoot);
+  } else {
+    return convertElementMatcherToBranchedMatcher(
+      equalityElementMatcher(valueSelector));
+  }
+};
+
+// Given an element matcher (which evaluates a single value), returns a branched
+// value (which evaluates the element matcher on all the branches and returns a
+// more structured return value possibly including arrayIndices).
+var convertElementMatcherToBranchedMatcher = function (
+    elementMatcher, options) {
+  options = options || {};
+  return function (branches) {
+    var expanded = branches;
+    if (!options.dontExpandLeafArrays) {
+      expanded = expandArraysInBranches(
+        branches, options.dontIncludeLeafArrays);
+    }
+    var ret = {};
+    ret.result = _.any(expanded, function (element) {
+      var matched = elementMatcher(element.value);
+
+      // Special case for $elemMatch: it means "true, and use this as an array
+      // index if I didn't already have one".
+      if (typeof matched === 'number') {
+        // XXX This code dates from when we only stored a single array index
+        // (for the outermost array). Should we be also including deeper array
+        // indices from the $elemMatch match?
+        if (!element.arrayIndices)
+          element.arrayIndices = [matched];
+        matched = true;
+      }
+
+      // If some element matched, and it's tagged with array indices, include
+      // those indices in our result object.
+      if (matched && element.arrayIndices)
+        ret.arrayIndices = element.arrayIndices;
+
+      return matched;
+    });
+    return ret;
+  };
+};
+
+// Takes a RegExp object and returns an element matcher.
+regexpElementMatcher = function (regexp) {
+  return function (value) {
+    if (value instanceof RegExp) {
+      // Comparing two regexps means seeing if the regexps are identical
+      // (really!). Underscore knows how.
+      return _.isEqual(value, regexp);
+    }
+    // Regexps only work against strings.
+    if (typeof value !== 'string')
+      return false;
+
+    // Reset regexp's state to avoid inconsistent matching for objects with the
+    // same value on consecutive calls of regexp.test. This happens only if the
+    // regexp has the 'g' flag. Also note that ES6 introduces a new flag 'y' for
+    // which we should *not* change the lastIndex but MongoDB doesn't support
+    // either of these flags.
+    regexp.lastIndex = 0;
+
+    return regexp.test(value);
+  };
+};
+
+// Takes something that is not an operator object and returns an element matcher
+// for equality with that thing.
+equalityElementMatcher = function (elementSelector) {
+  if (isOperatorObject(elementSelector))
+    throw Error("Can't create equalityValueSelector for operator object");
+
+  // Special-case: null and undefined are equal (if you got undefined in there
+  // somewhere, or if you got it due to some branch being non-existent in the
+  // weird special case), even though they aren't with EJSON.equals.
+  if (elementSelector == null) {  // undefined or null
+    return function (value) {
+      return value == null;  // undefined or null
+    };
+  }
+
+  return function (value) {
+    return LocalCollection._f._equal(elementSelector, value);
+  };
+};
+
+// Takes an operator object (an object with $ keys) and returns a branched
+// matcher for it.
+var operatorBranchedMatcher = function (valueSelector, matcher, isRoot) {
+  // Each valueSelector works separately on the various branches.  So one
+  // operator can match one branch and another can match another branch.  This
+  // is OK.
+
+  var operatorMatchers = [];
+  _.each(valueSelector, function (operand, operator) {
+    // XXX we should actually implement $eq, which is new in 2.6
+    var simpleRange = _.contains(['$lt', '$lte', '$gt', '$gte'], operator) &&
+      _.isNumber(operand);
+    var simpleInequality = operator === '$ne' && !_.isObject(operand);
+    var simpleInclusion = _.contains(['$in', '$nin'], operator) &&
+      _.isArray(operand) && !_.any(operand, _.isObject);
+
+    if (! (operator === '$eq' || simpleRange ||
+           simpleInclusion || simpleInequality)) {
+      matcher._isSimple = false;
+    }
+
+    if (_.has(VALUE_OPERATORS, operator)) {
+      operatorMatchers.push(
+        VALUE_OPERATORS[operator](operand, valueSelector, matcher, isRoot));
+    } else if (_.has(ELEMENT_OPERATORS, operator)) {
+      var options = ELEMENT_OPERATORS[operator];
+      operatorMatchers.push(
+        convertElementMatcherToBranchedMatcher(
+          options.compileElementSelector(
+            operand, valueSelector, matcher),
+          options));
+    } else {
+      throw new Error("Unrecognized operator: " + operator);
+    }
+  });
+
+  return andBranchedMatchers(operatorMatchers);
+};
+
+var compileArrayOfDocumentSelectors = function (
+    selectors, matcher, inElemMatch) {
+  if (!isArray(selectors) || _.isEmpty(selectors))
+    throw Error("$and/$or/$nor must be nonempty array");
+  return _.map(selectors, function (subSelector) {
+    if (!isPlainObject(subSelector))
+      throw Error("$or/$and/$nor entries need to be full objects");
+    return compileDocumentSelector(
+      subSelector, matcher, {inElemMatch: inElemMatch});
+  });
+};
+
+// Operators that appear at the top level of a document selector.
+var LOGICAL_OPERATORS = {
+  $and: function (subSelector, matcher, inElemMatch) {
+    var matchers = compileArrayOfDocumentSelectors(
+      subSelector, matcher, inElemMatch);
+    return andDocumentMatchers(matchers);
+  },
+
+  $or: function (subSelector, matcher, inElemMatch) {
+    var matchers = compileArrayOfDocumentSelectors(
+      subSelector, matcher, inElemMatch);
+
+    // Special case: if there is only one matcher, use it directly, *preserving*
+    // any arrayIndices it returns.
+    if (matchers.length === 1)
+      return matchers[0];
+
+    return function (doc) {
+      var result = _.any(matchers, function (f) {
+        return f(doc).result;
+      });
+      // $or does NOT set arrayIndices when it has multiple
+      // sub-expressions. (Tested against MongoDB.)
+      return {result: result};
+    };
+  },
+
+  $nor: function (subSelector, matcher, inElemMatch) {
+    var matchers = compileArrayOfDocumentSelectors(
+      subSelector, matcher, inElemMatch);
+    return function (doc) {
+      var result = _.all(matchers, function (f) {
+        return !f(doc).result;
+      });
+      // Never set arrayIndices, because we only match if nothing in particular
+      // "matched" (and because this is consistent with MongoDB).
+      return {result: result};
+    };
+  },
+
+  $where: function (selectorValue, matcher) {
+    // Record that *any* path may be used.
+    matcher._recordPathUsed('');
+    matcher._hasWhere = true;
+    if (!(selectorValue instanceof Function)) {
+      // XXX MongoDB seems to have more complex logic to decide where or or not
+      // to add "return"; not sure exactly what it is.
+      selectorValue = Function("obj", "return " + selectorValue);
+    }
+    return function (doc) {
+      // We make the document available as both `this` and `obj`.
+      // XXX not sure what we should do if this throws
+      return {result: selectorValue.call(doc, doc)};
+    };
+  },
+
+  // This is just used as a comment in the query (in MongoDB, it also ends up in
+  // query logs); it has no effect on the actual selection.
+  $comment: function () {
+    return function () {
+      return {result: true};
+    };
+  }
+};
+
+// Returns a branched matcher that matches iff the given matcher does not.
+// Note that this implicitly "deMorganizes" the wrapped function.  ie, it
+// means that ALL branch values need to fail to match innerBranchedMatcher.
+var invertBranchedMatcher = function (branchedMatcher) {
+  return function (branchValues) {
+    var invertMe = branchedMatcher(branchValues);
+    // We explicitly choose to strip arrayIndices here: it doesn't make sense to
+    // say "update the array element that does not match something", at least
+    // in mongo-land.
+    return {result: !invertMe.result};
+  };
+};
+
+// Operators that (unlike LOGICAL_OPERATORS) pertain to individual paths in a
+// document, but (unlike ELEMENT_OPERATORS) do not have a simple definition as
+// "match each branched value independently and combine with
+// convertElementMatcherToBranchedMatcher".
+var VALUE_OPERATORS = {
+  $not: function (operand, valueSelector, matcher) {
+    return invertBranchedMatcher(compileValueSelector(operand, matcher));
+  },
+  $ne: function (operand) {
+    return invertBranchedMatcher(convertElementMatcherToBranchedMatcher(
+      equalityElementMatcher(operand)));
+  },
+  $nin: function (operand) {
+    return invertBranchedMatcher(convertElementMatcherToBranchedMatcher(
+      ELEMENT_OPERATORS.$in.compileElementSelector(operand)));
+  },
+  $exists: function (operand) {
+    var exists = convertElementMatcherToBranchedMatcher(function (value) {
+      return value !== undefined;
+    });
+    return operand ? exists : invertBranchedMatcher(exists);
+  },
+  // $options just provides options for $regex; its logic is inside $regex
+  $options: function (operand, valueSelector) {
+    if (!_.has(valueSelector, '$regex'))
+      throw Error("$options needs a $regex");
+    return everythingMatcher;
+  },
+  // $maxDistance is basically an argument to $near
+  $maxDistance: function (operand, valueSelector) {
+    if (!valueSelector.$near)
+      throw Error("$maxDistance needs a $near");
+    return everythingMatcher;
+  },
+  $all: function (operand, valueSelector, matcher) {
+    if (!isArray(operand))
+      throw Error("$all requires array");
+    // Not sure why, but this seems to be what MongoDB does.
+    if (_.isEmpty(operand))
+      return nothingMatcher;
+
+    var branchedMatchers = [];
+    _.each(operand, function (criterion) {
+      // XXX handle $all/$elemMatch combination
+      if (isOperatorObject(criterion))
+        throw Error("no $ expressions in $all");
+      // This is always a regexp or equality selector.
+      branchedMatchers.push(compileValueSelector(criterion, matcher));
+    });
+    // andBranchedMatchers does NOT require all selectors to return true on the
+    // SAME branch.
+    return andBranchedMatchers(branchedMatchers);
+  },
+  $near: function (operand, valueSelector, matcher, isRoot) {
+    if (!isRoot)
+      throw Error("$near can't be inside another $ operator");
+    matcher._hasGeoQuery = true;
+
+    // There are two kinds of geodata in MongoDB: coordinate pairs and
+    // GeoJSON. They use different distance metrics, too. GeoJSON queries are
+    // marked with a $geometry property.
+
+    var maxDistance, point, distance;
+    if (isPlainObject(operand) && _.has(operand, '$geometry')) {
+      // GeoJSON "2dsphere" mode.
+      maxDistance = operand.$maxDistance;
+      point = operand.$geometry;
+      distance = function (value) {
+        // XXX: for now, we don't calculate the actual distance between, say,
+        // polygon and circle. If people care about this use-case it will get
+        // a priority.
+        if (!value || !value.type)
+          return null;
+        if (value.type === "Point") {
+          return GeoJSON.pointDistance(point, value);
+        } else {
+          return GeoJSON.geometryWithinRadius(value, point, maxDistance)
+            ? 0 : maxDistance + 1;
+        }
+      };
+    } else {
+      maxDistance = valueSelector.$maxDistance;
+      if (!isArray(operand) && !isPlainObject(operand))
+        throw Error("$near argument must be coordinate pair or GeoJSON");
+      point = pointToArray(operand);
+      distance = function (value) {
+        if (!isArray(value) && !isPlainObject(value))
+          return null;
+        return distanceCoordinatePairs(point, value);
+      };
+    }
+
+    return function (branchedValues) {
+      // There might be multiple points in the document that match the given
+      // field. Only one of them needs to be within $maxDistance, but we need to
+      // evaluate all of them and use the nearest one for the implicit sort
+      // specifier. (That's why we can't just use ELEMENT_OPERATORS here.)
+      //
+      // Note: This differs from MongoDB's implementation, where a document will
+      // actually show up *multiple times* in the result set, with one entry for
+      // each within-$maxDistance branching point.
+      branchedValues = expandArraysInBranches(branchedValues);
+      var result = {result: false};
+      _.each(branchedValues, function (branch) {
+        var curDistance = distance(branch.value);
+        // Skip branches that aren't real points or are too far away.
+        if (curDistance === null || curDistance > maxDistance)
+          return;
+        // Skip anything that's a tie.
+        if (result.distance !== undefined && result.distance <= curDistance)
+          return;
+        result.result = true;
+        result.distance = curDistance;
+        if (!branch.arrayIndices)
+          delete result.arrayIndices;
+        else
+          result.arrayIndices = branch.arrayIndices;
+      });
+      return result;
+    };
+  }
+};
+
+// Helpers for $near.
+var distanceCoordinatePairs = function (a, b) {
+  a = pointToArray(a);
+  b = pointToArray(b);
+  var x = a[0] - b[0];
+  var y = a[1] - b[1];
+  if (_.isNaN(x) || _.isNaN(y))
+    return null;
+  return Math.sqrt(x * x + y * y);
+};
+// Makes sure we get 2 elements array and assume the first one to be x and
+// the second one to y no matter what user passes.
+// In case user passes { lon: x, lat: y } returns [x, y]
+var pointToArray = function (point) {
+  return _.map(point, _.identity);
+};
+
+// Helper for $lt/$gt/$lte/$gte.
+var makeInequality = function (cmpValueComparator) {
+  return {
+    compileElementSelector: function (operand) {
+      // Arrays never compare false with non-arrays for any inequality.
+      // XXX This was behavior we observed in pre-release MongoDB 2.5, but
+      //     it seems to have been reverted.
+      //     See https://jira.mongodb.org/browse/SERVER-11444
+      if (isArray(operand)) {
+        return function () {
+          return false;
+        };
+      }
+
+      // Special case: consider undefined and null the same (so true with
+      // $gte/$lte).
+      if (operand === undefined)
+        operand = null;
+
+      var operandType = LocalCollection._f._type(operand);
+
+      return function (value) {
+        if (value === undefined)
+          value = null;
+        // Comparisons are never true among things of different type (except
+        // null vs undefined).
+        if (LocalCollection._f._type(value) !== operandType)
+          return false;
+        return cmpValueComparator(LocalCollection._f._cmp(value, operand));
+      };
+    }
+  };
+};
+
+// Each element selector contains:
+//  - compileElementSelector, a function with args:
+//    - operand - the "right hand side" of the operator
+//    - valueSelector - the "context" for the operator (so that $regex can find
+//      $options)
+//    - matcher - the Matcher this is going into (so that $elemMatch can compile
+//      more things)
+//    returning a function mapping a single value to bool.
+//  - dontExpandLeafArrays, a bool which prevents expandArraysInBranches from
+//    being called
+//  - dontIncludeLeafArrays, a bool which causes an argument to be passed to
+//    expandArraysInBranches if it is called
+ELEMENT_OPERATORS = {
+  $lt: makeInequality(function (cmpValue) {
+    return cmpValue < 0;
+  }),
+  $gt: makeInequality(function (cmpValue) {
+    return cmpValue > 0;
+  }),
+  $lte: makeInequality(function (cmpValue) {
+    return cmpValue <= 0;
+  }),
+  $gte: makeInequality(function (cmpValue) {
+    return cmpValue >= 0;
+  }),
+  $mod: {
+    compileElementSelector: function (operand) {
+      if (!(isArray(operand) && operand.length === 2
+            && typeof(operand[0]) === 'number'
+            && typeof(operand[1]) === 'number')) {
+        throw Error("argument to $mod must be an array of two numbers");
+      }
+      // XXX could require to be ints or round or something
+      var divisor = operand[0];
+      var remainder = operand[1];
+      return function (value) {
+        return typeof value === 'number' && value % divisor === remainder;
+      };
+    }
+  },
+  $in: {
+    compileElementSelector: function (operand) {
+      if (!isArray(operand))
+        throw Error("$in needs an array");
+
+      var elementMatchers = [];
+      _.each(operand, function (option) {
+        if (option instanceof RegExp)
+          elementMatchers.push(regexpElementMatcher(option));
+        else if (isOperatorObject(option))
+          throw Error("cannot nest $ under $in");
+        else
+          elementMatchers.push(equalityElementMatcher(option));
+      });
+
+      return function (value) {
+        // Allow {a: {$in: [null]}} to match when 'a' does not exist.
+        if (value === undefined)
+          value = null;
+        return _.any(elementMatchers, function (e) {
+          return e(value);
+        });
+      };
+    }
+  },
+  $size: {
+    // {a: [[5, 5]]} must match {a: {$size: 1}} but not {a: {$size: 2}}, so we
+    // don't want to consider the element [5,5] in the leaf array [[5,5]] as a
+    // possible value.
+    dontExpandLeafArrays: true,
+    compileElementSelector: function (operand) {
+      if (typeof operand === 'string') {
+        // Don't ask me why, but by experimentation, this seems to be what Mongo
+        // does.
+        operand = 0;
+      } else if (typeof operand !== 'number') {
+        throw Error("$size needs a number");
+      }
+      return function (value) {
+        return isArray(value) && value.length === operand;
+      };
+    }
+  },
+  $type: {
+    // {a: [5]} must not match {a: {$type: 4}} (4 means array), but it should
+    // match {a: {$type: 1}} (1 means number), and {a: [[5]]} must match {$a:
+    // {$type: 4}}. Thus, when we see a leaf array, we *should* expand it but
+    // should *not* include it itself.
+    dontIncludeLeafArrays: true,
+    compileElementSelector: function (operand) {
+      if (typeof operand !== 'number')
+        throw Error("$type needs a number");
+      return function (value) {
+        return value !== undefined
+          && LocalCollection._f._type(value) === operand;
+      };
+    }
+  },
+  $regex: {
+    compileElementSelector: function (operand, valueSelector) {
+      if (!(typeof operand === 'string' || operand instanceof RegExp))
+        throw Error("$regex has to be a string or RegExp");
+
+      var regexp;
+      if (valueSelector.$options !== undefined) {
+        // Options passed in $options (even the empty string) always overrides
+        // options in the RegExp object itself. (See also
+        // Mongo.Collection._rewriteSelector.)
+
+        // Be clear that we only support the JS-supported options, not extended
+        // ones (eg, Mongo supports x and s). Ideally we would implement x and s
+        // by transforming the regexp, but not today...
+        if (/[^gim]/.test(valueSelector.$options))
+          throw new Error("Only the i, m, and g regexp options are supported");
+
+        var regexSource = operand instanceof RegExp ? operand.source : operand;
+        regexp = new RegExp(regexSource, valueSelector.$options);
+      } else if (operand instanceof RegExp) {
+        regexp = operand;
+      } else {
+        regexp = new RegExp(operand);
+      }
+      return regexpElementMatcher(regexp);
+    }
+  },
+  $elemMatch: {
+    dontExpandLeafArrays: true,
+    compileElementSelector: function (operand, valueSelector, matcher) {
+      if (!isPlainObject(operand))
+        throw Error("$elemMatch need an object");
+
+      var subMatcher, isDocMatcher;
+      if (isOperatorObject(_.omit(operand, _.keys(LOGICAL_OPERATORS)), true)) {
+        subMatcher = compileValueSelector(operand, matcher);
+        isDocMatcher = false;
+      } else {
+        // This is NOT the same as compileValueSelector(operand), and not just
+        // because of the slightly different calling convention.
+        // {$elemMatch: {x: 3}} means "an element has a field x:3", not
+        // "consists only of a field x:3". Also, regexps and sub-$ are allowed.
+        subMatcher = compileDocumentSelector(operand, matcher,
+                                             {inElemMatch: true});
+        isDocMatcher = true;
+      }
+
+      return function (value) {
+        if (!isArray(value))
+          return false;
+        for (var i = 0; i < value.length; ++i) {
+          var arrayElement = value[i];
+          var arg;
+          if (isDocMatcher) {
+            // We can only match {$elemMatch: {b: 3}} against objects.
+            // (We can also match against arrays, if there's numeric indices,
+            // eg {$elemMatch: {'0.b': 3}} or {$elemMatch: {0: 3}}.)
+            if (!isPlainObject(arrayElement) && !isArray(arrayElement))
+              return false;
+            arg = arrayElement;
+          } else {
+            // dontIterate ensures that {a: {$elemMatch: {$gt: 5}}} matches
+            // {a: [8]} but not {a: [[8]]}
+            arg = [{value: arrayElement, dontIterate: true}];
+          }
+          // XXX support $near in $elemMatch by propagating $distance?
+          if (subMatcher(arg).result)
+            return i;   // specially understood to mean "use as arrayIndices"
+        }
+        return false;
+      };
+    }
+  }
+};
+
+// makeLookupFunction(key) returns a lookup function.
+//
+// A lookup function takes in a document and returns an array of matching
+// branches.  If no arrays are found while looking up the key, this array will
+// have exactly one branches (possibly 'undefined', if some segment of the key
+// was not found).
+//
+// If arrays are found in the middle, this can have more than one element, since
+// we "branch". When we "branch", if there are more key segments to look up,
+// then we only pursue branches that are plain objects (not arrays or scalars).
+// This means we can actually end up with no branches!
+//
+// We do *NOT* branch on arrays that are found at the end (ie, at the last
+// dotted member of the key). We just return that array; if you want to
+// effectively "branch" over the array's values, post-process the lookup
+// function with expandArraysInBranches.
+//
+// Each branch is an object with keys:
+//  - value: the value at the branch
+//  - dontIterate: an optional bool; if true, it means that 'value' is an array
+//    that expandArraysInBranches should NOT expand. This specifically happens
+//    when there is a numeric index in the key, and ensures the
+//    perhaps-surprising MongoDB behavior where {'a.0': 5} does NOT
+//    match {a: [[5]]}.
+//  - arrayIndices: if any array indexing was done during lookup (either due to
+//    explicit numeric indices or implicit branching), this will be an array of
+//    the array indices used, from outermost to innermost; it is falsey or
+//    absent if no array index is used. If an explicit numeric index is used,
+//    the index will be followed in arrayIndices by the string 'x'.
+//
+//    Note: arrayIndices is used for two purposes. First, it is used to
+//    implement the '$' modifier feature, which only ever looks at its first
+//    element.
+//
+//    Second, it is used for sort key generation, which needs to be able to tell
+//    the difference between different paths. Moreover, it needs to
+//    differentiate between explicit and implicit branching, which is why
+//    there's the somewhat hacky 'x' entry: this means that explicit and
+//    implicit array lookups will have different full arrayIndices paths. (That
+//    code only requires that different paths have different arrayIndices; it
+//    doesn't actually "parse" arrayIndices. As an alternative, arrayIndices
+//    could contain objects with flags like "implicit", but I think that only
+//    makes the code surrounding them more complex.)
+//
+//    (By the way, this field ends up getting passed around a lot without
+//    cloning, so never mutate any arrayIndices field/var in this package!)
+//
+//
+// At the top level, you may only pass in a plain object or array.
+//
+// See the test 'minimongo - lookup' for some examples of what lookup functions
+// return.
+makeLookupFunction = function (key, options) {
+  options = options || {};
+  var parts = key.split('.');
+  var firstPart = parts.length ? parts[0] : '';
+  var firstPartIsNumeric = isNumericKey(firstPart);
+  var nextPartIsNumeric = parts.length >= 2 && isNumericKey(parts[1]);
+  var lookupRest;
+  if (parts.length > 1) {
+    lookupRest = makeLookupFunction(parts.slice(1).join('.'));
+  }
+
+  var omitUnnecessaryFields = function (retVal) {
+    if (!retVal.dontIterate)
+      delete retVal.dontIterate;
+    if (retVal.arrayIndices && !retVal.arrayIndices.length)
+      delete retVal.arrayIndices;
+    return retVal;
+  };
+
+  // Doc will always be a plain object or an array.
+  // apply an explicit numeric index, an array.
+  return function (doc, arrayIndices) {
+    if (!arrayIndices)
+      arrayIndices = [];
+
+    if (isArray(doc)) {
+      // If we're being asked to do an invalid lookup into an array (non-integer
+      // or out-of-bounds), return no results (which is different from returning
+      // a single undefined result, in that `null` equality checks won't match).
+      if (!(firstPartIsNumeric && firstPart < doc.length))
+        return [];
+
+      // Remember that we used this array index. Include an 'x' to indicate that
+      // the previous index came from being considered as an explicit array
+      // index (not branching).
+      arrayIndices = arrayIndices.concat(+firstPart, 'x');
+    }
+
+    // Do our first lookup.
+    var firstLevel = doc[firstPart];
+
+    // If there is no deeper to dig, return what we found.
+    //
+    // If what we found is an array, most value selectors will choose to treat
+    // the elements of the array as matchable values in their own right, but
+    // that's done outside of the lookup function. (Exceptions to this are $size
+    // and stuff relating to $elemMatch.  eg, {a: {$size: 2}} does not match {a:
+    // [[1, 2]]}.)
+    //
+    // That said, if we just did an *explicit* array lookup (on doc) to find
+    // firstLevel, and firstLevel is an array too, we do NOT want value
+    // selectors to iterate over it.  eg, {'a.0': 5} does not match {a: [[5]]}.
+    // So in that case, we mark the return value as "don't iterate".
+    if (!lookupRest) {
+      return [omitUnnecessaryFields({
+        value: firstLevel,
+        dontIterate: isArray(doc) && isArray(firstLevel),
+        arrayIndices: arrayIndices})];
+    }
+
+    // We need to dig deeper.  But if we can't, because what we've found is not
+    // an array or plain object, we're done. If we just did a numeric index into
+    // an array, we return nothing here (this is a change in Mongo 2.5 from
+    // Mongo 2.4, where {'a.0.b': null} stopped matching {a: [5]}). Otherwise,
+    // return a single `undefined` (which can, for example, match via equality
+    // with `null`).
+    if (!isIndexable(firstLevel)) {
+      if (isArray(doc))
+        return [];
+      return [omitUnnecessaryFields({value: undefined,
+                                      arrayIndices: arrayIndices})];
+    }
+
+    var result = [];
+    var appendToResult = function (more) {
+      Array.prototype.push.apply(result, more);
+    };
+
+    // Dig deeper: look up the rest of the parts on whatever we've found.
+    // (lookupRest is smart enough to not try to do invalid lookups into
+    // firstLevel if it's an array.)
+    appendToResult(lookupRest(firstLevel, arrayIndices));
+
+    // If we found an array, then in *addition* to potentially treating the next
+    // part as a literal integer lookup, we should also "branch": try to look up
+    // the rest of the parts on each array element in parallel.
+    //
+    // In this case, we *only* dig deeper into array elements that are plain
+    // objects. (Recall that we only got this far if we have further to dig.)
+    // This makes sense: we certainly don't dig deeper into non-indexable
+    // objects. And it would be weird to dig into an array: it's simpler to have
+    // a rule that explicit integer indexes only apply to an outer array, not to
+    // an array you find after a branching search.
+    //
+    // In the special case of a numeric part in a *sort selector* (not a query
+    // selector), we skip the branching: we ONLY allow the numeric part to mean
+    // "look up this index" in that case, not "also look up this index in all
+    // the elements of the array".
+    if (isArray(firstLevel) && !(nextPartIsNumeric && options.forSort)) {
+      _.each(firstLevel, function (branch, arrayIndex) {
+        if (isPlainObject(branch)) {
+          appendToResult(lookupRest(
+            branch,
+            arrayIndices.concat(arrayIndex)));
+        }
+      });
+    }
+
+    return result;
+  };
+};
+MinimongoTest.makeLookupFunction = makeLookupFunction;
+
+expandArraysInBranches = function (branches, skipTheArrays) {
+  var branchesOut = [];
+  _.each(branches, function (branch) {
+    var thisIsArray = isArray(branch.value);
+    // We include the branch itself, *UNLESS* we it's an array that we're going
+    // to iterate and we're told to skip arrays.  (That's right, we include some
+    // arrays even skipTheArrays is true: these are arrays that were found via
+    // explicit numerical indices.)
+    if (!(skipTheArrays && thisIsArray && !branch.dontIterate)) {
+      branchesOut.push({
+        value: branch.value,
+        arrayIndices: branch.arrayIndices
+      });
+    }
+    if (thisIsArray && !branch.dontIterate) {
+      _.each(branch.value, function (leaf, i) {
+        branchesOut.push({
+          value: leaf,
+          arrayIndices: (branch.arrayIndices || []).concat(i)
+        });
+      });
+    }
+  });
+  return branchesOut;
+};
+
+var nothingMatcher = function (docOrBranchedValues) {
+  return {result: false};
+};
+
+var everythingMatcher = function (docOrBranchedValues) {
+  return {result: true};
+};
+
+
+// NB: We are cheating and using this function to implement "AND" for both
+// "document matchers" and "branched matchers". They both return result objects
+// but the argument is different: for the former it's a whole doc, whereas for
+// the latter it's an array of "branched values".
+var andSomeMatchers = function (subMatchers) {
+  if (subMatchers.length === 0)
+    return everythingMatcher;
+  if (subMatchers.length === 1)
+    return subMatchers[0];
+
+  return function (docOrBranches) {
+    var ret = {};
+    ret.result = _.all(subMatchers, function (f) {
+      var subResult = f(docOrBranches);
+      // Copy a 'distance' number out of the first sub-matcher that has
+      // one. Yes, this means that if there are multiple $near fields in a
+      // query, something arbitrary happens; this appears to be consistent with
+      // Mongo.
+      if (subResult.result && subResult.distance !== undefined
+          && ret.distance === undefined) {
+        ret.distance = subResult.distance;
+      }
+      // Similarly, propagate arrayIndices from sub-matchers... but to match
+      // MongoDB behavior, this time the *last* sub-matcher with arrayIndices
+      // wins.
+      if (subResult.result && subResult.arrayIndices) {
+        ret.arrayIndices = subResult.arrayIndices;
+      }
+      return subResult.result;
+    });
+
+    // If we didn't actually match, forget any extra metadata we came up with.
+    if (!ret.result) {
+      delete ret.distance;
+      delete ret.arrayIndices;
+    }
+    return ret;
+  };
+};
+
+var andDocumentMatchers = andSomeMatchers;
+var andBranchedMatchers = andSomeMatchers;
+
+
+// helpers used by compiled selector code
+LocalCollection._f = {
+  // XXX for _all and _in, consider building 'inquery' at compile time..
+
+  _type: function (v) {
+    if (typeof v === "number")
+      return 1;
+    if (typeof v === "string")
+      return 2;
+    if (typeof v === "boolean")
+      return 8;
+    if (isArray(v))
+      return 4;
+    if (v === null)
+      return 10;
+    if (v instanceof RegExp)
+      // note that typeof(/x/) === "object"
+      return 11;
+    if (typeof v === "function")
+      return 13;
+    if (v instanceof Date)
+      return 9;
+    if (EJSON.isBinary(v))
+      return 5;
+    if (v instanceof MongoID.ObjectID)
+      return 7;
+    return 3; // object
+
+    // XXX support some/all of these:
+    // 14, symbol
+    // 15, javascript code with scope
+    // 16, 18: 32-bit/64-bit integer
+    // 17, timestamp
+    // 255, minkey
+    // 127, maxkey
+  },
+
+  // deep equality test: use for literal document and array matches
+  _equal: function (a, b) {
+    return EJSON.equals(a, b, {keyOrderSensitive: true});
+  },
+
+  // maps a type code to a value that can be used to sort values of
+  // different types
+  _typeorder: function (t) {
+    // http://www.mongodb.org/display/DOCS/What+is+the+Compare+Order+for+BSON+Types
+    // XXX what is the correct sort position for Javascript code?
+    // ('100' in the matrix below)
+    // XXX minkey/maxkey
+    return [-1,  // (not a type)
+            1,   // number
+            2,   // string
+            3,   // object
+            4,   // array
+            5,   // binary
+            -1,  // deprecated
+            6,   // ObjectID
+            7,   // bool
+            8,   // Date
+            0,   // null
+            9,   // RegExp
+            -1,  // deprecated
+            100, // JS code
+            2,   // deprecated (symbol)
+            100, // JS code
+            1,   // 32-bit int
+            8,   // Mongo timestamp
+            1    // 64-bit int
+           ][t];
+  },
+
+  // compare two values of unknown type according to BSON ordering
+  // semantics. (as an extension, consider 'undefined' to be less than
+  // any other value.) return negative if a is less, positive if b is
+  // less, or 0 if equal
+  _cmp: function (a, b) {
+    if (a === undefined)
+      return b === undefined ? 0 : -1;
+    if (b === undefined)
+      return 1;
+    var ta = LocalCollection._f._type(a);
+    var tb = LocalCollection._f._type(b);
+    var oa = LocalCollection._f._typeorder(ta);
+    var ob = LocalCollection._f._typeorder(tb);
+    if (oa !== ob)
+      return oa < ob ? -1 : 1;
+    if (ta !== tb)
+      // XXX need to implement this if we implement Symbol or integers, or
+      // Timestamp
+      throw Error("Missing type coercion logic in _cmp");
+    if (ta === 7) { // ObjectID
+      // Convert to string.
+      ta = tb = 2;
+      a = a.toHexString();
+      b = b.toHexString();
+    }
+    if (ta === 9) { // Date
+      // Convert to millis.
+      ta = tb = 1;
+      a = a.getTime();
+      b = b.getTime();
+    }
+
+    if (ta === 1) // double
+      return a - b;
+    if (tb === 2) // string
+      return a < b ? -1 : (a === b ? 0 : 1);
+    if (ta === 3) { // Object
+      // this could be much more efficient in the expected case ...
+      var to_array = function (obj) {
+        var ret = [];
+        for (var key in obj) {
+          ret.push(key);
+          ret.push(obj[key]);
+        }
+        return ret;
+      };
+      return LocalCollection._f._cmp(to_array(a), to_array(b));
+    }
+    if (ta === 4) { // Array
+      for (var i = 0; ; i++) {
+        if (i === a.length)
+          return (i === b.length) ? 0 : -1;
+        if (i === b.length)
+          return 1;
+        var s = LocalCollection._f._cmp(a[i], b[i]);
+        if (s !== 0)
+          return s;
+      }
+    }
+    if (ta === 5) { // binary
+      // Surprisingly, a small binary blob is always less than a large one in
+      // Mongo.
+      if (a.length !== b.length)
+        return a.length - b.length;
+      for (i = 0; i < a.length; i++) {
+        if (a[i] < b[i])
+          return -1;
+        if (a[i] > b[i])
+          return 1;
+      }
+      return 0;
+    }
+    if (ta === 8) { // boolean
+      if (a) return b ? 0 : 1;
+      return b ? -1 : 0;
+    }
+    if (ta === 10) // null
+      return 0;
+    if (ta === 11) // regexp
+      throw Error("Sorting not supported on regular expression"); // XXX
+    // 13: javascript code
+    // 14: symbol
+    // 15: javascript code with scope
+    // 16: 32-bit integer
+    // 17: timestamp
+    // 18: 64-bit integer
+    // 255: minkey
+    // 127: maxkey
+    if (ta === 13) // javascript code
+      throw Error("Sorting not supported on Javascript code"); // XXX
+    throw Error("Unknown type to sort");
+  }
+};
+
+// Oddball function used by upsert.
+LocalCollection._removeDollarOperators = function (selector) {
+  var selectorDoc = {};
+  for (var k in selector)
+    if (k.substr(0, 1) !== '$')
+      selectorDoc[k] = selector[k];
+  return selectorDoc;
+};
+// Give a sort spec, which can be in any of these forms:
+//   {"key1": 1, "key2": -1}
+//   [["key1", "asc"], ["key2", "desc"]]
+//   ["key1", ["key2", "desc"]]
+//
+// (.. with the first form being dependent on the key enumeration
+// behavior of your javascript VM, which usually does what you mean in
+// this case if the key names don't look like integers ..)
+//
+// return a function that takes two objects, and returns -1 if the
+// first object comes first in order, 1 if the second object comes
+// first, or 0 if neither object comes before the other.
+
+Minimongo.Sorter = function (spec, options) {
+  var self = this;
+  options = options || {};
+
+  self._sortSpecParts = [];
+  self._sortFunction = null;
+
+  var addSpecPart = function (path, ascending) {
+    if (!path)
+      throw Error("sort keys must be non-empty");
+    if (path.charAt(0) === '$')
+      throw Error("unsupported sort key: " + path);
+    self._sortSpecParts.push({
+      path: path,
+      lookup: makeLookupFunction(path, {forSort: true}),
+      ascending: ascending
+    });
+  };
+
+  if (spec instanceof Array) {
+    for (var i = 0; i < spec.length; i++) {
+      if (typeof spec[i] === "string") {
+        addSpecPart(spec[i], true);
+      } else {
+        addSpecPart(spec[i][0], spec[i][1] !== "desc");
+      }
+    }
+  } else if (typeof spec === "object") {
+    _.each(spec, function (value, key) {
+      addSpecPart(key, value >= 0);
+    });
+  } else if (typeof spec === "function") {
+    self._sortFunction = spec;
+  } else {
+    throw Error("Bad sort specification: " + JSON.stringify(spec));
+  }
+
+  // If a function is specified for sorting, we skip the rest.
+  if (self._sortFunction)
+    return;
+
+  // To implement affectedByModifier, we piggy-back on top of Matcher's
+  // affectedByModifier code; we create a selector that is affected by the same
+  // modifiers as this sort order. This is only implemented on the server.
+  if (self.affectedByModifier) {
+    var selector = {};
+    _.each(self._sortSpecParts, function (spec) {
+      selector[spec.path] = 1;
+    });
+    self._selectorForAffectedByModifier = new Minimongo.Matcher(selector);
+  }
+
+  self._keyComparator = composeComparators(
+    _.map(self._sortSpecParts, function (spec, i) {
+      return self._keyFieldComparator(i);
+    }));
+
+  // If you specify a matcher for this Sorter, _keyFilter may be set to a
+  // function which selects whether or not a given "sort key" (tuple of values
+  // for the different sort spec fields) is compatible with the selector.
+  self._keyFilter = null;
+  options.matcher && self._useWithMatcher(options.matcher);
+};
+
+// In addition to these methods, sorter_project.js defines combineIntoProjection
+// on the server only.
+_.extend(Minimongo.Sorter.prototype, {
+  getComparator: function (options) {
+    var self = this;
+
+    // If we have no distances, just use the comparator from the source
+    // specification (which defaults to "everything is equal".
+    if (!options || !options.distances) {
+      return self._getBaseComparator();
+    }
+
+    var distances = options.distances;
+
+    // Return a comparator which first tries the sort specification, and if that
+    // says "it's equal", breaks ties using $near distances.
+    return composeComparators([self._getBaseComparator(), function (a, b) {
+      if (!distances.has(a._id))
+        throw Error("Missing distance for " + a._id);
+      if (!distances.has(b._id))
+        throw Error("Missing distance for " + b._id);
+      return distances.get(a._id) - distances.get(b._id);
+    }]);
+  },
+
+  _getPaths: function () {
+    var self = this;
+    return _.pluck(self._sortSpecParts, 'path');
+  },
+
+  // Finds the minimum key from the doc, according to the sort specs.  (We say
+  // "minimum" here but this is with respect to the sort spec, so "descending"
+  // sort fields mean we're finding the max for that field.)
+  //
+  // Note that this is NOT "find the minimum value of the first field, the
+  // minimum value of the second field, etc"... it's "choose the
+  // lexicographically minimum value of the key vector, allowing only keys which
+  // you can find along the same paths".  ie, for a doc {a: [{x: 0, y: 5}, {x:
+  // 1, y: 3}]} with sort spec {'a.x': 1, 'a.y': 1}, the only keys are [0,5] and
+  // [1,3], and the minimum key is [0,5]; notably, [0,3] is NOT a key.
+  _getMinKeyFromDoc: function (doc) {
+    var self = this;
+    var minKey = null;
+
+    self._generateKeysFromDoc(doc, function (key) {
+      if (!self._keyCompatibleWithSelector(key))
+        return;
+
+      if (minKey === null) {
+        minKey = key;
+        return;
+      }
+      if (self._compareKeys(key, minKey) < 0) {
+        minKey = key;
+      }
+    });
+
+    // This could happen if our key filter somehow filters out all the keys even
+    // though somehow the selector matches.
+    if (minKey === null)
+      throw Error("sort selector found no keys in doc?");
+    return minKey;
+  },
+
+  _keyCompatibleWithSelector: function (key) {
+    var self = this;
+    return !self._keyFilter || self._keyFilter(key);
+  },
+
+  // Iterates over each possible "key" from doc (ie, over each branch), calling
+  // 'cb' with the key.
+  _generateKeysFromDoc: function (doc, cb) {
+    var self = this;
+
+    if (self._sortSpecParts.length === 0)
+      throw new Error("can't generate keys without a spec");
+
+    // maps index -> ({'' -> value} or {path -> value})
+    var valuesByIndexAndPath = [];
+
+    var pathFromIndices = function (indices) {
+      return indices.join(',') + ',';
+    };
+
+    var knownPaths = null;
+
+    _.each(self._sortSpecParts, function (spec, whichField) {
+      // Expand any leaf arrays that we find, and ignore those arrays
+      // themselves.  (We never sort based on an array itself.)
+      var branches = expandArraysInBranches(spec.lookup(doc), true);
+
+      // If there are no values for a key (eg, key goes to an empty array),
+      // pretend we found one null value.
+      if (!branches.length)
+        branches = [{value: null}];
+
+      var usedPaths = false;
+      valuesByIndexAndPath[whichField] = {};
+      _.each(branches, function (branch) {
+        if (!branch.arrayIndices) {
+          // If there are no array indices for a branch, then it must be the
+          // only branch, because the only thing that produces multiple branches
+          // is the use of arrays.
+          if (branches.length > 1)
+            throw Error("multiple branches but no array used?");
+          valuesByIndexAndPath[whichField][''] = branch.value;
+          return;
+        }
+
+        usedPaths = true;
+        var path = pathFromIndices(branch.arrayIndices);
+        if (_.has(valuesByIndexAndPath[whichField], path))
+          throw Error("duplicate path: " + path);
+        valuesByIndexAndPath[whichField][path] = branch.value;
+
+        // If two sort fields both go into arrays, they have to go into the
+        // exact same arrays and we have to find the same paths.  This is
+        // roughly the same condition that makes MongoDB throw this strange
+        // error message.  eg, the main thing is that if sort spec is {a: 1,
+        // b:1} then a and b cannot both be arrays.
+        //
+        // (In MongoDB it seems to be OK to have {a: 1, 'a.x.y': 1} where 'a'
+        // and 'a.x.y' are both arrays, but we don't allow this for now.
+        // #NestedArraySort
+        // XXX achieve full compatibility here
+        if (knownPaths && !_.has(knownPaths, path)) {
+          throw Error("cannot index parallel arrays");
+        }
+      });
+
+      if (knownPaths) {
+        // Similarly to above, paths must match everywhere, unless this is a
+        // non-array field.
+        if (!_.has(valuesByIndexAndPath[whichField], '') &&
+            _.size(knownPaths) !== _.size(valuesByIndexAndPath[whichField])) {
+          throw Error("cannot index parallel arrays!");
+        }
+      } else if (usedPaths) {
+        knownPaths = {};
+        _.each(valuesByIndexAndPath[whichField], function (x, path) {
+          knownPaths[path] = true;
+        });
+      }
+    });
+
+    if (!knownPaths) {
+      // Easy case: no use of arrays.
+      var soleKey = _.map(valuesByIndexAndPath, function (values) {
+        if (!_.has(values, ''))
+          throw Error("no value in sole key case?");
+        return values[''];
+      });
+      cb(soleKey);
+      return;
+    }
+
+    _.each(knownPaths, function (x, path) {
+      var key = _.map(valuesByIndexAndPath, function (values) {
+        if (_.has(values, ''))
+          return values[''];
+        if (!_.has(values, path))
+          throw Error("missing path?");
+        return values[path];
+      });
+      cb(key);
+    });
+  },
+
+  // Takes in two keys: arrays whose lengths match the number of spec
+  // parts. Returns negative, 0, or positive based on using the sort spec to
+  // compare fields.
+  _compareKeys: function (key1, key2) {
+    var self = this;
+    if (key1.length !== self._sortSpecParts.length ||
+        key2.length !== self._sortSpecParts.length) {
+      throw Error("Key has wrong length");
+    }
+
+    return self._keyComparator(key1, key2);
+  },
+
+  // Given an index 'i', returns a comparator that compares two key arrays based
+  // on field 'i'.
+  _keyFieldComparator: function (i) {
+    var self = this;
+    var invert = !self._sortSpecParts[i].ascending;
+    return function (key1, key2) {
+      var compare = LocalCollection._f._cmp(key1[i], key2[i]);
+      if (invert)
+        compare = -compare;
+      return compare;
+    };
+  },
+
+  // Returns a comparator that represents the sort specification (but not
+  // including a possible geoquery distance tie-breaker).
+  _getBaseComparator: function () {
+    var self = this;
+
+    if (self._sortFunction)
+      return self._sortFunction;
+
+    // If we're only sorting on geoquery distance and no specs, just say
+    // everything is equal.
+    if (!self._sortSpecParts.length) {
+      return function (doc1, doc2) {
+        return 0;
+      };
+    }
+
+    return function (doc1, doc2) {
+      var key1 = self._getMinKeyFromDoc(doc1);
+      var key2 = self._getMinKeyFromDoc(doc2);
+      return self._compareKeys(key1, key2);
+    };
+  },
+
+  // In MongoDB, if you have documents
+  //    {_id: 'x', a: [1, 10]} and
+  //    {_id: 'y', a: [5, 15]},
+  // then C.find({}, {sort: {a: 1}}) puts x before y (1 comes before 5).
+  // But  C.find({a: {$gt: 3}}, {sort: {a: 1}}) puts y before x (1 does not
+  // match the selector, and 5 comes before 10).
+  //
+  // The way this works is pretty subtle!  For example, if the documents
+  // are instead {_id: 'x', a: [{x: 1}, {x: 10}]}) and
+  //             {_id: 'y', a: [{x: 5}, {x: 15}]}),
+  // then C.find({'a.x': {$gt: 3}}, {sort: {'a.x': 1}}) and
+  //      C.find({a: {$elemMatch: {x: {$gt: 3}}}}, {sort: {'a.x': 1}})
+  // both follow this rule (y before x).  (ie, you do have to apply this
+  // through $elemMatch.)
+  //
+  // So if you pass a matcher to this sorter's constructor, we will attempt to
+  // skip sort keys that don't match the selector. The logic here is pretty
+  // subtle and undocumented; we've gotten as close as we can figure out based
+  // on our understanding of Mongo's behavior.
+  _useWithMatcher: function (matcher) {
+    var self = this;
+
+    if (self._keyFilter)
+      throw Error("called _useWithMatcher twice?");
+
+    // If we are only sorting by distance, then we're not going to bother to
+    // build a key filter.
+    // XXX figure out how geoqueries interact with this stuff
+    if (_.isEmpty(self._sortSpecParts))
+      return;
+
+    var selector = matcher._selector;
+
+    // If the user just passed a literal function to find(), then we can't get a
+    // key filter from it.
+    if (selector instanceof Function)
+      return;
+
+    var constraintsByPath = {};
+    _.each(self._sortSpecParts, function (spec, i) {
+      constraintsByPath[spec.path] = [];
+    });
+
+    _.each(selector, function (subSelector, key) {
+      // XXX support $and and $or
+
+      var constraints = constraintsByPath[key];
+      if (!constraints)
+        return;
+
+      // XXX it looks like the real MongoDB implementation isn't "does the
+      // regexp match" but "does the value fall into a range named by the
+      // literal prefix of the regexp", ie "foo" in /^foo(bar|baz)+/  But
+      // "does the regexp match" is a good approximation.
+      if (subSelector instanceof RegExp) {
+        // As far as we can tell, using either of the options that both we and
+        // MongoDB support ('i' and 'm') disables use of the key filter. This
+        // makes sense: MongoDB mostly appears to be calculating ranges of an
+        // index to use, which means it only cares about regexps that match
+        // one range (with a literal prefix), and both 'i' and 'm' prevent the
+        // literal prefix of the regexp from actually meaning one range.
+        if (subSelector.ignoreCase || subSelector.multiline)
+          return;
+        constraints.push(regexpElementMatcher(subSelector));
+        return;
+      }
+
+      if (isOperatorObject(subSelector)) {
+        _.each(subSelector, function (operand, operator) {
+          if (_.contains(['$lt', '$lte', '$gt', '$gte'], operator)) {
+            // XXX this depends on us knowing that these operators don't use any
+            // of the arguments to compileElementSelector other than operand.
+            constraints.push(
+              ELEMENT_OPERATORS[operator].compileElementSelector(operand));
+          }
+
+          // See comments in the RegExp block above.
+          if (operator === '$regex' && !subSelector.$options) {
+            constraints.push(
+              ELEMENT_OPERATORS.$regex.compileElementSelector(
+                operand, subSelector));
+          }
+
+          // XXX support {$exists: true}, $mod, $type, $in, $elemMatch
+        });
+        return;
+      }
+
+      // OK, it's an equality thing.
+      constraints.push(equalityElementMatcher(subSelector));
+    });
+
+    // It appears that the first sort field is treated differently from the
+    // others; we shouldn't create a key filter unless the first sort field is
+    // restricted, though after that point we can restrict the other sort fields
+    // or not as we wish.
+    if (_.isEmpty(constraintsByPath[self._sortSpecParts[0].path]))
+      return;
+
+    self._keyFilter = function (key) {
+      return _.all(self._sortSpecParts, function (specPart, index) {
+        return _.all(constraintsByPath[specPart.path], function (f) {
+          return f(key[index]);
+        });
+      });
+    };
+  }
+});
+
+// Given an array of comparators
+// (functions (a,b)->(negative or positive or zero)), returns a single
+// comparator which uses each comparator in order and returns the first
+// non-zero value.
+var composeComparators = function (comparatorArray) {
+  return function (a, b) {
+    for (var i = 0; i < comparatorArray.length; ++i) {
+      var compare = comparatorArray[i](a, b);
+      if (compare !== 0)
+        return compare;
+    }
+    return 0;
+  };
+};
+// Knows how to compile a fields projection to a predicate function.
+// @returns - Function: a closure that filters out an object according to the
+//            fields projection rules:
+//            @param obj - Object: MongoDB-styled document
+//            @returns - Object: a document with the fields filtered out
+//                       according to projection rules. Doesn't retain subfields
+//                       of passed argument.
+LocalCollection._compileProjection = function (fields) {
+  LocalCollection._checkSupportedProjection(fields);
+
+  var _idProjection = _.isUndefined(fields._id) ? true : fields._id;
+  var details = projectionDetails(fields);
+
+  // returns transformed doc according to ruleTree
+  var transform = function (doc, ruleTree) {
+    // Special case for "sets"
+    if (_.isArray(doc))
+      return _.map(doc, function (subdoc) { return transform(subdoc, ruleTree); });
+
+    var res = details.including ? {} : EJSON.clone(doc);
+    _.each(ruleTree, function (rule, key) {
+      if (!_.has(doc, key))
+        return;
+      if (_.isObject(rule)) {
+        // For sub-objects/subsets we branch
+        if (_.isObject(doc[key]))
+          res[key] = transform(doc[key], rule);
+        // Otherwise we don't even touch this subfield
+      } else if (details.including)
+        res[key] = EJSON.clone(doc[key]);
+      else
+        delete res[key];
+    });
+
+    return res;
+  };
+
+  return function (obj) {
+    var res = transform(obj, details.tree);
+
+    if (_idProjection && _.has(obj, '_id'))
+      res._id = obj._id;
+    if (!_idProjection && _.has(res, '_id'))
+      delete res._id;
+    return res;
+  };
+};
+
+// Traverses the keys of passed projection and constructs a tree where all
+// leaves are either all True or all False
+// @returns Object:
+//  - tree - Object - tree representation of keys involved in projection
+//  (exception for '_id' as it is a special case handled separately)
+//  - including - Boolean - "take only certain fields" type of projection
+projectionDetails = function (fields) {
+  // Find the non-_id keys (_id is handled specially because it is included unless
+  // explicitly excluded). Sort the keys, so that our code to detect overlaps
+  // like 'foo' and 'foo.bar' can assume that 'foo' comes first.
+  var fieldsKeys = _.keys(fields).sort();
+
+  // If _id is the only field in the projection, do not remove it, since it is
+  // required to determine if this is an exclusion or exclusion. Also keep an
+  // inclusive _id, since inclusive _id follows the normal rules about mixing
+  // inclusive and exclusive fields. If _id is not the only field in the
+  // projection and is exclusive, remove it so it can be handled later by a
+  // special case, since exclusive _id is always allowed.
+  if (fieldsKeys.length > 0 &&
+      !(fieldsKeys.length === 1 && fieldsKeys[0] === '_id') &&
+      !(_.contains(fieldsKeys, '_id') && fields['_id']))
+    fieldsKeys = _.reject(fieldsKeys, function (key) { return key === '_id'; });
+
+  var including = null; // Unknown
+
+  _.each(fieldsKeys, function (keyPath) {
+    var rule = !!fields[keyPath];
+    if (including === null)
+      including = rule;
+    if (including !== rule)
+      // This error message is copied from MongoDB shell
+      throw MinimongoError("You cannot currently mix including and excluding fields.");
+  });
+
+
+  var projectionRulesTree = pathsToTree(
+    fieldsKeys,
+    function (path) { return including; },
+    function (node, path, fullPath) {
+      // Check passed projection fields' keys: If you have two rules such as
+      // 'foo.bar' and 'foo.bar.baz', then the result becomes ambiguous. If
+      // that happens, there is a probability you are doing something wrong,
+      // framework should notify you about such mistake earlier on cursor
+      // compilation step than later during runtime.  Note, that real mongo
+      // doesn't do anything about it and the later rule appears in projection
+      // project, more priority it takes.
+      //
+      // Example, assume following in mongo shell:
+      // > db.coll.insert({ a: { b: 23, c: 44 } })
+      // > db.coll.find({}, { 'a': 1, 'a.b': 1 })
+      // { "_id" : ObjectId("520bfe456024608e8ef24af3"), "a" : { "b" : 23 } }
+      // > db.coll.find({}, { 'a.b': 1, 'a': 1 })
+      // { "_id" : ObjectId("520bfe456024608e8ef24af3"), "a" : { "b" : 23, "c" : 44 } }
+      //
+      // Note, how second time the return set of keys is different.
+
+      var currentPath = fullPath;
+      var anotherPath = path;
+      throw MinimongoError("both " + currentPath + " and " + anotherPath +
+                           " found in fields option, using both of them may trigger " +
+                           "unexpected behavior. Did you mean to use only one of them?");
+    });
+
+  return {
+    tree: projectionRulesTree,
+    including: including
+  };
+};
+
+// paths - Array: list of mongo style paths
+// newLeafFn - Function: of form function(path) should return a scalar value to
+//                       put into list created for that path
+// conflictFn - Function: of form function(node, path, fullPath) is called
+//                        when building a tree path for 'fullPath' node on
+//                        'path' was already a leaf with a value. Must return a
+//                        conflict resolution.
+// initial tree - Optional Object: starting tree.
+// @returns - Object: tree represented as a set of nested objects
+pathsToTree = function (paths, newLeafFn, conflictFn, tree) {
+  tree = tree || {};
+  _.each(paths, function (keyPath) {
+    var treePos = tree;
+    var pathArr = keyPath.split('.');
+
+    // use _.all just for iteration with break
+    var success = _.all(pathArr.slice(0, -1), function (key, idx) {
+      if (!_.has(treePos, key))
+        treePos[key] = {};
+      else if (!_.isObject(treePos[key])) {
+        treePos[key] = conflictFn(treePos[key],
+                                  pathArr.slice(0, idx + 1).join('.'),
+                                  keyPath);
+        // break out of loop if we are failing for this path
+        if (!_.isObject(treePos[key]))
+          return false;
+      }
+
+      treePos = treePos[key];
+      return true;
+    });
+
+    if (success) {
+      var lastKey = _.last(pathArr);
+      if (!_.has(treePos, lastKey))
+        treePos[lastKey] = newLeafFn(keyPath);
+      else
+        treePos[lastKey] = conflictFn(treePos[lastKey], keyPath, keyPath);
+    }
+  });
+
+  return tree;
+};
+
+LocalCollection._checkSupportedProjection = function (fields) {
+  if (!_.isObject(fields) || _.isArray(fields))
+    throw MinimongoError("fields option must be an object");
+
+  _.each(fields, function (val, keyPath) {
+    if (_.contains(keyPath.split('.'), '$'))
+      throw MinimongoError("Minimongo doesn't support $ operator in projections yet.");
+    if (typeof val === 'object' && _.intersection(['$elemMatch', '$meta', '$slice'], _.keys(val)).length > 0)
+      throw MinimongoError("Minimongo doesn't support operators in projections yet.");
+    if (_.indexOf([1, 0, true, false], val) === -1)
+      throw MinimongoError("Projection values should be one of 1, 0, true, or false");
+  });
+};
+// XXX need a strategy for passing the binding of $ into this
+// function, from the compiled selector
+//
+// maybe just {key.up.to.just.before.dollarsign: array_index}
+//
+// XXX atomicity: if one modification fails, do we roll back the whole
+// change?
+//
+// options:
+//   - isInsert is set when _modify is being called to compute the document to
+//     insert as part of an upsert operation. We use this primarily to figure
+//     out when to set the fields in $setOnInsert, if present.
+LocalCollection._modify = function (doc, mod, options) {
+  options = options || {};
+  if (!isPlainObject(mod))
+    throw MinimongoError("Modifier must be an object");
+
+  // Make sure the caller can't mutate our data structures.
+  mod = EJSON.clone(mod);
+
+  var isModifier = isOperatorObject(mod);
+
+  var newDoc;
+
+  if (!isModifier) {
+    if (mod._id && !EJSON.equals(doc._id, mod._id))
+      throw MinimongoError("Cannot change the _id of a document");
+
+    // replace the whole document
+    for (var k in mod) {
+      if (/\./.test(k))
+        throw MinimongoError(
+          "When replacing document, field name may not contain '.'");
+    }
+    newDoc = mod;
+  } else {
+    // apply modifiers to the doc.
+    newDoc = EJSON.clone(doc);
+
+    _.each(mod, function (operand, op) {
+      var modFunc = MODIFIERS[op];
+      // Treat $setOnInsert as $set if this is an insert.
+      if (options.isInsert && op === '$setOnInsert')
+        modFunc = MODIFIERS['$set'];
+      if (!modFunc)
+        throw MinimongoError("Invalid modifier specified " + op);
+      _.each(operand, function (arg, keypath) {
+        if (keypath === '') {
+          throw MinimongoError("An empty update path is not valid.");
+        }
+
+        if (keypath === '_id') {
+          throw MinimongoError("Mod on _id not allowed");
+        }
+
+        var keyparts = keypath.split('.');
+
+        if (! _.all(keyparts, _.identity)) {
+          throw MinimongoError(
+            "The update path '" + keypath +
+              "' contains an empty field name, which is not allowed.");
+        }
+
+        var noCreate = _.has(NO_CREATE_MODIFIERS, op);
+        var forbidArray = (op === "$rename");
+        var target = findModTarget(newDoc, keyparts, {
+          noCreate: NO_CREATE_MODIFIERS[op],
+          forbidArray: (op === "$rename"),
+          arrayIndices: options.arrayIndices
+        });
+        var field = keyparts.pop();
+        modFunc(target, field, arg, keypath, newDoc);
+      });
+    });
+  }
+
+  // move new document into place.
+  _.each(_.keys(doc), function (k) {
+    // Note: this used to be for (var k in doc) however, this does not
+    // work right in Opera. Deleting from a doc while iterating over it
+    // would sometimes cause opera to skip some keys.
+    if (k !== '_id')
+      delete doc[k];
+  });
+  _.each(newDoc, function (v, k) {
+    doc[k] = v;
+  });
+};
+
+// for a.b.c.2.d.e, keyparts should be ['a', 'b', 'c', '2', 'd', 'e'],
+// and then you would operate on the 'e' property of the returned
+// object.
+//
+// if options.noCreate is falsey, creates intermediate levels of
+// structure as necessary, like mkdir -p (and raises an exception if
+// that would mean giving a non-numeric property to an array.) if
+// options.noCreate is true, return undefined instead.
+//
+// may modify the last element of keyparts to signal to the caller that it needs
+// to use a different value to index into the returned object (for example,
+// ['a', '01'] -> ['a', 1]).
+//
+// if forbidArray is true, return null if the keypath goes through an array.
+//
+// if options.arrayIndices is set, use its first element for the (first) '$' in
+// the path.
+var findModTarget = function (doc, keyparts, options) {
+  options = options || {};
+  var usedArrayIndex = false;
+  for (var i = 0; i < keyparts.length; i++) {
+    var last = (i === keyparts.length - 1);
+    var keypart = keyparts[i];
+    var indexable = isIndexable(doc);
+    if (!indexable) {
+      if (options.noCreate)
+        return undefined;
+      var e = MinimongoError(
+        "cannot use the part '" + keypart + "' to traverse " + doc);
+      e.setPropertyError = true;
+      throw e;
+    }
+    if (doc instanceof Array) {
+      if (options.forbidArray)
+        return null;
+      if (keypart === '$') {
+        if (usedArrayIndex)
+          throw MinimongoError("Too many positional (i.e. '$') elements");
+        if (!options.arrayIndices || !options.arrayIndices.length) {
+          throw MinimongoError("The positional operator did not find the " +
+                               "match needed from the query");
+        }
+        keypart = options.arrayIndices[0];
+        usedArrayIndex = true;
+      } else if (isNumericKey(keypart)) {
+        keypart = parseInt(keypart);
+      } else {
+        if (options.noCreate)
+          return undefined;
+        throw MinimongoError(
+          "can't append to array using string field name ["
+                    + keypart + "]");
+      }
+      if (last)
+        // handle 'a.01'
+        keyparts[i] = keypart;
+      if (options.noCreate && keypart >= doc.length)
+        return undefined;
+      while (doc.length < keypart)
+        doc.push(null);
+      if (!last) {
+        if (doc.length === keypart)
+          doc.push({});
+        else if (typeof doc[keypart] !== "object")
+          throw MinimongoError("can't modify field '" + keyparts[i + 1] +
+                      "' of list value " + JSON.stringify(doc[keypart]));
+      }
+    } else {
+      if (keypart.length && keypart.substr(0, 1) === '$')
+        throw MinimongoError("can't set field named " + keypart);
+      if (!(keypart in doc)) {
+        if (options.noCreate)
+          return undefined;
+        if (!last)
+          doc[keypart] = {};
+      }
+    }
+
+    if (last)
+      return doc;
+    doc = doc[keypart];
+  }
+
+  // notreached
+};
+
+var NO_CREATE_MODIFIERS = {
+  $unset: true,
+  $pop: true,
+  $rename: true,
+  $pull: true,
+  $pullAll: true
+};
+
+var MODIFIERS = {
+  $inc: function (target, field, arg) {
+    if (typeof arg !== "number")
+      throw MinimongoError("Modifier $inc allowed for numbers only");
+    if (field in target) {
+      if (typeof target[field] !== "number")
+        throw MinimongoError("Cannot apply $inc modifier to non-number");
+      target[field] += arg;
+    } else {
+      target[field] = arg;
+    }
+  },
+  $set: function (target, field, arg) {
+    if (!_.isObject(target)) { // not an array or an object
+      var e = MinimongoError("Cannot set property on non-object field");
+      e.setPropertyError = true;
+      throw e;
+    }
+    if (target === null) {
+      var e = MinimongoError("Cannot set property on null");
+      e.setPropertyError = true;
+      throw e;
+    }
+    target[field] = arg;
+  },
+  $setOnInsert: function (target, field, arg) {
+    // converted to `$set` in `_modify`
+  },
+  $unset: function (target, field, arg) {
+    if (target !== undefined) {
+      if (target instanceof Array) {
+        if (field in target)
+          target[field] = null;
+      } else
+        delete target[field];
+    }
+  },
+  $push: function (target, field, arg) {
+    if (target[field] === undefined)
+      target[field] = [];
+    if (!(target[field] instanceof Array))
+      throw MinimongoError("Cannot apply $push modifier to non-array");
+
+    if (!(arg && arg.$each)) {
+      // Simple mode: not $each
+      target[field].push(arg);
+      return;
+    }
+
+    // Fancy mode: $each (and maybe $slice and $sort and $position)
+    var toPush = arg.$each;
+    if (!(toPush instanceof Array))
+      throw MinimongoError("$each must be an array");
+
+    // Parse $position
+    var position = undefined;
+    if ('$position' in arg) {
+      if (typeof arg.$position !== "number")
+        throw MinimongoError("$position must be a numeric value");
+      // XXX should check to make sure integer
+      if (arg.$position < 0)
+        throw MinimongoError("$position in $push must be zero or positive");
+      position = arg.$position;
+    }
+
+    // Parse $slice.
+    var slice = undefined;
+    if ('$slice' in arg) {
+      if (typeof arg.$slice !== "number")
+        throw MinimongoError("$slice must be a numeric value");
+      // XXX should check to make sure integer
+      if (arg.$slice > 0)
+        throw MinimongoError("$slice in $push must be zero or negative");
+      slice = arg.$slice;
+    }
+
+    // Parse $sort.
+    var sortFunction = undefined;
+    if (arg.$sort) {
+      if (slice === undefined)
+        throw MinimongoError("$sort requires $slice to be present");
+      // XXX this allows us to use a $sort whose value is an array, but that's
+      // actually an extension of the Node driver, so it won't work
+      // server-side. Could be confusing!
+      // XXX is it correct that we don't do geo-stuff here?
+      sortFunction = new Minimongo.Sorter(arg.$sort).getComparator();
+      for (var i = 0; i < toPush.length; i++) {
+        if (LocalCollection._f._type(toPush[i]) !== 3) {
+          throw MinimongoError("$push like modifiers using $sort " +
+                      "require all elements to be objects");
+        }
+      }
+    }
+
+    // Actually push.
+    if (position === undefined) {
+      for (var j = 0; j < toPush.length; j++)
+        target[field].push(toPush[j]);
+    } else {
+      var spliceArguments = [position, 0];
+      for (var j = 0; j < toPush.length; j++)
+        spliceArguments.push(toPush[j]);
+      Array.prototype.splice.apply(target[field], spliceArguments);
+    }
+
+    // Actually sort.
+    if (sortFunction)
+      target[field].sort(sortFunction);
+
+    // Actually slice.
+    if (slice !== undefined) {
+      if (slice === 0)
+        target[field] = [];  // differs from Array.slice!
+      else
+        target[field] = target[field].slice(slice);
+    }
+  },
+  $pushAll: function (target, field, arg) {
+    if (!(typeof arg === "object" && arg instanceof Array))
+      throw MinimongoError("Modifier $pushAll/pullAll allowed for arrays only");
+    var x = target[field];
+    if (x === undefined)
+      target[field] = arg;
+    else if (!(x instanceof Array))
+      throw MinimongoError("Cannot apply $pushAll modifier to non-array");
+    else {
+      for (var i = 0; i < arg.length; i++)
+        x.push(arg[i]);
+    }
+  },
+  $addToSet: function (target, field, arg) {
+    var isEach = false;
+    if (typeof arg === "object") {
+      //check if first key is '$each'
+      for (var k in arg) {
+        if (k === "$each")
+          isEach = true;
+        break;
+      }
+    }
+    var values = isEach ? arg["$each"] : [arg];
+    var x = target[field];
+    if (x === undefined)
+      target[field] = values;
+    else if (!(x instanceof Array))
+      throw MinimongoError("Cannot apply $addToSet modifier to non-array");
+    else {
+      _.each(values, function (value) {
+        for (var i = 0; i < x.length; i++)
+          if (LocalCollection._f._equal(value, x[i]))
+            return;
+        x.push(value);
+      });
+    }
+  },
+  $pop: function (target, field, arg) {
+    if (target === undefined)
+      return;
+    var x = target[field];
+    if (x === undefined)
+      return;
+    else if (!(x instanceof Array))
+      throw MinimongoError("Cannot apply $pop modifier to non-array");
+    else {
+      if (typeof arg === 'number' && arg < 0)
+        x.splice(0, 1);
+      else
+        x.pop();
+    }
+  },
+  $pull: function (target, field, arg) {
+    if (target === undefined)
+      return;
+    var x = target[field];
+    if (x === undefined)
+      return;
+    else if (!(x instanceof Array))
+      throw MinimongoError("Cannot apply $pull/pullAll modifier to non-array");
+    else {
+      var out = [];
+      if (arg != null && typeof arg === "object" && !(arg instanceof Array)) {
+        // XXX would be much nicer to compile this once, rather than
+        // for each document we modify.. but usually we're not
+        // modifying that many documents, so we'll let it slide for
+        // now
+
+        // XXX Minimongo.Matcher isn't up for the job, because we need
+        // to permit stuff like {$pull: {a: {$gt: 4}}}.. something
+        // like {$gt: 4} is not normally a complete selector.
+        // same issue as $elemMatch possibly?
+        var matcher = new Minimongo.Matcher(arg);
+        for (var i = 0; i < x.length; i++)
+          if (!matcher.documentMatches(x[i]).result)
+            out.push(x[i]);
+      } else {
+        for (var i = 0; i < x.length; i++)
+          if (!LocalCollection._f._equal(x[i], arg))
+            out.push(x[i]);
+      }
+      target[field] = out;
+    }
+  },
+  $pullAll: function (target, field, arg) {
+    if (!(typeof arg === "object" && arg instanceof Array))
+      throw MinimongoError("Modifier $pushAll/pullAll allowed for arrays only");
+    if (target === undefined)
+      return;
+    var x = target[field];
+    if (x === undefined)
+      return;
+    else if (!(x instanceof Array))
+      throw MinimongoError("Cannot apply $pull/pullAll modifier to non-array");
+    else {
+      var out = [];
+      for (var i = 0; i < x.length; i++) {
+        var exclude = false;
+        for (var j = 0; j < arg.length; j++) {
+          if (LocalCollection._f._equal(x[i], arg[j])) {
+            exclude = true;
+            break;
+          }
+        }
+        if (!exclude)
+          out.push(x[i]);
+      }
+      target[field] = out;
+    }
+  },
+  $rename: function (target, field, arg, keypath, doc) {
+    if (keypath === arg)
+      // no idea why mongo has this restriction..
+      throw MinimongoError("$rename source must differ from target");
+    if (target === null)
+      throw MinimongoError("$rename source field invalid");
+    if (typeof arg !== "string")
+      throw MinimongoError("$rename target must be a string");
+    if (target === undefined)
+      return;
+    var v = target[field];
+    delete target[field];
+
+    var keyparts = arg.split('.');
+    var target2 = findModTarget(doc, keyparts, {forbidArray: true});
+    if (target2 === null)
+      throw MinimongoError("$rename target field invalid");
+    var field2 = keyparts.pop();
+    target2[field2] = v;
+  },
+  $bit: function (target, field, arg) {
+    // XXX mongo only supports $bit on integers, and we only support
+    // native javascript numbers (doubles) so far, so we can't support $bit
+    throw MinimongoError("$bit is not supported");
+  }
+};
+// ordered: bool.
+// old_results and new_results: collections of documents.
+//    if ordered, they are arrays.
+//    if unordered, they are IdMaps
+LocalCollection._diffQueryChanges = function (ordered, oldResults, newResults, observer, options) {
+  return DiffSequence.diffQueryChanges(ordered, oldResults, newResults, observer, options);
+};
+
+LocalCollection._diffQueryUnorderedChanges = function (oldResults, newResults, observer, options) {
+  return DiffSequence.diffQueryUnorderedChanges(oldResults, newResults, observer, options);
+};
+
+
+LocalCollection._diffQueryOrderedChanges =
+  function (oldResults, newResults, observer, options) {
+  return DiffSequence.diffQueryOrderedChanges(oldResults, newResults, observer, options);
+};
+
+LocalCollection._diffObjects = function (left, right, callbacks) {
+  return DiffSequence.diffObjects(left, right, callbacks);
+};
+LocalCollection._IdMap = function () {
+  var self = this;
+  IdMap.call(self, MongoID.idStringify, MongoID.idParse);
+};
+
+Meteor._inherits(LocalCollection._IdMap, IdMap);
+
+// XXX maybe move these into another ObserveHelpers package or something
+
+// _CachingChangeObserver is an object which receives observeChanges callbacks
+// and keeps a cache of the current cursor state up to date in self.docs. Users
+// of this class should read the docs field but not modify it. You should pass
+// the "applyChange" field as the callbacks to the underlying observeChanges
+// call. Optionally, you can specify your own observeChanges callbacks which are
+// invoked immediately before the docs field is updated; this object is made
+// available as `this` to those callbacks.
+LocalCollection._CachingChangeObserver = function (options) {
+  var self = this;
+  options = options || {};
+
+  var orderedFromCallbacks = options.callbacks &&
+        LocalCollection._observeChangesCallbacksAreOrdered(options.callbacks);
+  if (_.has(options, 'ordered')) {
+    self.ordered = options.ordered;
+    if (options.callbacks && options.ordered !== orderedFromCallbacks)
+      throw Error("ordered option doesn't match callbacks");
+  } else if (options.callbacks) {
+    self.ordered = orderedFromCallbacks;
+  } else {
+    throw Error("must provide ordered or callbacks");
+  }
+  var callbacks = options.callbacks || {};
+
+  if (self.ordered) {
+    self.docs = new OrderedDict(MongoID.idStringify);
+    self.applyChange = {
+      addedBefore: function (id, fields, before) {
+        var doc = EJSON.clone(fields);
+        doc._id = id;
+        callbacks.addedBefore && callbacks.addedBefore.call(
+          self, id, fields, before);
+        // This line triggers if we provide added with movedBefore.
+        callbacks.added && callbacks.added.call(self, id, fields);
+        // XXX could `before` be a falsy ID?  Technically
+        // idStringify seems to allow for them -- though
+        // OrderedDict won't call stringify on a falsy arg.
+        self.docs.putBefore(id, doc, before || null);
+      },
+      movedBefore: function (id, before) {
+        var doc = self.docs.get(id);
+        callbacks.movedBefore && callbacks.movedBefore.call(self, id, before);
+        self.docs.moveBefore(id, before || null);
+      }
+    };
+  } else {
+    self.docs = new LocalCollection._IdMap;
+    self.applyChange = {
+      added: function (id, fields) {
+        var doc = EJSON.clone(fields);
+        callbacks.added && callbacks.added.call(self, id, fields);
+        doc._id = id;
+        self.docs.set(id,  doc);
+      }
+    };
+  }
+
+  // The methods in _IdMap and OrderedDict used by these callbacks are
+  // identical.
+  self.applyChange.changed = function (id, fields) {
+    var doc = self.docs.get(id);
+    if (!doc)
+      throw new Error("Unknown id for changed: " + id);
+    callbacks.changed && callbacks.changed.call(
+      self, id, EJSON.clone(fields));
+    DiffSequence.applyChanges(doc, fields);
+  };
+  self.applyChange.removed = function (id) {
+    callbacks.removed && callbacks.removed.call(self, id);
+    self.docs.remove(id);
+  };
+};
+
+LocalCollection._observeFromObserveChanges = function (cursor, observeCallbacks) {
+  var transform = cursor.getTransform() || function (doc) {return doc;};
+  var suppressed = !!observeCallbacks._suppress_initial;
+
+  var observeChangesCallbacks;
+  if (LocalCollection._observeCallbacksAreOrdered(observeCallbacks)) {
+    // The "_no_indices" option sets all index arguments to -1 and skips the
+    // linear scans required to generate them.  This lets observers that don't
+    // need absolute indices benefit from the other features of this API --
+    // relative order, transforms, and applyChanges -- without the speed hit.
+    var indices = !observeCallbacks._no_indices;
+    observeChangesCallbacks = {
+      addedBefore: function (id, fields, before) {
+        var self = this;
+        if (suppressed || !(observeCallbacks.addedAt || observeCallbacks.added))
+          return;
+        var doc = transform(_.extend(fields, {_id: id}));
+        if (observeCallbacks.addedAt) {
+          var index = indices
+                ? (before ? self.docs.indexOf(before) : self.docs.size()) : -1;
+          observeCallbacks.addedAt(doc, index, before);
+        } else {
+          observeCallbacks.added(doc);
+        }
+      },
+      changed: function (id, fields) {
+        var self = this;
+        if (!(observeCallbacks.changedAt || observeCallbacks.changed))
+          return;
+        var doc = EJSON.clone(self.docs.get(id));
+        if (!doc)
+          throw new Error("Unknown id for changed: " + id);
+        var oldDoc = transform(EJSON.clone(doc));
+        DiffSequence.applyChanges(doc, fields);
+        doc = transform(doc);
+        if (observeCallbacks.changedAt) {
+          var index = indices ? self.docs.indexOf(id) : -1;
+          observeCallbacks.changedAt(doc, oldDoc, index);
+        } else {
+          observeCallbacks.changed(doc, oldDoc);
+        }
+      },
+      movedBefore: function (id, before) {
+        var self = this;
+        if (!observeCallbacks.movedTo)
+          return;
+        var from = indices ? self.docs.indexOf(id) : -1;
+
+        var to = indices
+              ? (before ? self.docs.indexOf(before) : self.docs.size()) : -1;
+        // When not moving backwards, adjust for the fact that removing the
+        // document slides everything back one slot.
+        if (to > from)
+          --to;
+        observeCallbacks.movedTo(transform(EJSON.clone(self.docs.get(id))),
+                                 from, to, before || null);
+      },
+      removed: function (id) {
+        var self = this;
+        if (!(observeCallbacks.removedAt || observeCallbacks.removed))
+          return;
+        // technically maybe there should be an EJSON.clone here, but it's about
+        // to be removed from self.docs!
+        var doc = transform(self.docs.get(id));
+        if (observeCallbacks.removedAt) {
+          var index = indices ? self.docs.indexOf(id) : -1;
+          observeCallbacks.removedAt(doc, index);
+        } else {
+          observeCallbacks.removed(doc);
+        }
+      }
+    };
+  } else {
+    observeChangesCallbacks = {
+      added: function (id, fields) {
+        if (!suppressed && observeCallbacks.added) {
+          var doc = _.extend(fields, {_id:  id});
+          observeCallbacks.added(transform(doc));
+        }
+      },
+      changed: function (id, fields) {
+        var self = this;
+        if (observeCallbacks.changed) {
+          var oldDoc = self.docs.get(id);
+          var doc = EJSON.clone(oldDoc);
+          DiffSequence.applyChanges(doc, fields);
+          observeCallbacks.changed(transform(doc),
+                                   transform(EJSON.clone(oldDoc)));
+        }
+      },
+      removed: function (id) {
+        var self = this;
+        if (observeCallbacks.removed) {
+          observeCallbacks.removed(transform(self.docs.get(id)));
+        }
+      }
+    };
+  }
+
+  var changeObserver = new LocalCollection._CachingChangeObserver(
+    {callbacks: observeChangesCallbacks});
+  var handle = cursor.observeChanges(changeObserver.applyChange);
+  suppressed = false;
+
+  return handle;
+};
+// Is this selector just shorthand for lookup by _id?
+LocalCollection._selectorIsId = function (selector) {
+  return (typeof selector === "string") ||
+    (typeof selector === "number") ||
+    selector instanceof MongoID.ObjectID;
+};
+
+// Is the selector just lookup by _id (shorthand or not)?
+LocalCollection._selectorIsIdPerhapsAsObject = function (selector) {
+  return LocalCollection._selectorIsId(selector) ||
+    (selector && typeof selector === "object" &&
+     selector._id && LocalCollection._selectorIsId(selector._id) &&
+     _.size(selector) === 1);
+};
+
+// If this is a selector which explicitly constrains the match by ID to a finite
+// number of documents, returns a list of their IDs.  Otherwise returns
+// null. Note that the selector may have other restrictions so it may not even
+// match those document!  We care about $in and $and since those are generated
+// access-controlled update and remove.
+LocalCollection._idsMatchedBySelector = function (selector) {
+  // Is the selector just an ID?
+  if (LocalCollection._selectorIsId(selector))
+    return [selector];
+  if (!selector)
+    return null;
+
+  // Do we have an _id clause?
+  if (_.has(selector, '_id')) {
+    // Is the _id clause just an ID?
+    if (LocalCollection._selectorIsId(selector._id))
+      return [selector._id];
+    // Is the _id clause {_id: {$in: ["x", "y", "z"]}}?
+    if (selector._id && selector._id.$in
+        && _.isArray(selector._id.$in)
+        && !_.isEmpty(selector._id.$in)
+        && _.all(selector._id.$in, LocalCollection._selectorIsId)) {
+      return selector._id.$in;
+    }
+    return null;
+  }
+
+  // If this is a top-level $and, and any of the clauses constrain their
+  // documents, then the whole selector is constrained by any one clause's
+  // constraint. (Well, by their intersection, but that seems unlikely.)
+  if (selector.$and && _.isArray(selector.$and)) {
+    for (var i = 0; i < selector.$and.length; ++i) {
+      var subIds = LocalCollection._idsMatchedBySelector(selector.$and[i]);
+      if (subIds)
+        return subIds;
+    }
+  }
+
+  return null;
+};
+
+
+  Meteor.Minimongo = Minimongo;
+  Meteor.MinimongoTest = MinimongoTest;
+  Meteor.LocalCollection = LocalCollection;
+};
+
+},{}],41:[function(require,module,exports){
 module.exports=function(Meteor) {
   var _ = Meteor.underscore;
   var EJSON = Meteor.EJSON;
@@ -12639,88 +23558,21 @@ MongoID.idParse = function (id) {
   Meteor.MongoID = MongoID;
 };
 
-},{}],28:[function(require,module,exports){
+},{}],42:[function(require,module,exports){
 module.exports = function(Meteor) {
   var seqChangedToEmpty ,seqChangedToArray ,seqChangedToCursor;
   var _ = Meteor.underscore;
   var Random = Meteor.Random;
   var Tracker = Meteor.Tracker;
+  var DiffSequence = Meteor.DiffSequence;
   var LocalCollection = Meteor.LocalCollection;
+  var OrderedDict = Meteor.OrderedDict;
   var ReactiveVar = Meteor.ReactiveVar;
   var EJSON = Meteor.EJSON;
   var MongoID = Meteor.MongoID;
   var ObserveSequence;
 
-
-  //Copied from minimongo package to remove dependency, as this code should go into a helper package
-  var LocalCollection = {};
-  var Package = {minimongo: {LocalCollection: LocalCollection}};
-
-// NB: used by livedata
-LocalCollection._idStringify = function (id) {
-  if (id instanceof LocalCollection._ObjectID) {
-    return id.valueOf();
-  } else if (typeof id === 'string') {
-    if (id === "") {
-      return id;
-    } else if (id.substr(0, 1) === "-" || // escape previously dashed strings
-               id.substr(0, 1) === "~" || // escape escaped numbers, true, false
-               LocalCollection._looksLikeObjectID(id) || // escape object-id-form strings
-               id.substr(0, 1) === '{') { // escape object-form strings, for maybe implementing later
-      return "-" + id;
-    } else {
-      return id; // other strings go through unchanged.
-    }
-  } else if (id === undefined) {
-    return '-';
-  } else if (typeof id === 'object' && id !== null) {
-    throw new Error("Meteor does not currently support objects other than ObjectID as ids");
-  } else { // Numbers, true, false, null
-    return "~" + JSON.stringify(id);
-  }
-};
-
-
-// NB: used by livedata
-LocalCollection._idParse = function (id) {
-  if (id === "") {
-    return id;
-  } else if (id === '-') {
-    return undefined;
-  } else if (id.substr(0, 1) === '-') {
-    return id.substr(1);
-  } else if (id.substr(0, 1) === '~') {
-    return JSON.parse(id.substr(1));
-  } else if (LocalCollection._looksLikeObjectID(id)) {
-    return new LocalCollection._ObjectID(id);
-  } else {
-    return id;
-  }
-};
-
-LocalCollection._makeChangedFields = function (newDoc, oldDoc) {
-  var fields = {};
-  LocalCollection._diffObjects(oldDoc, newDoc, {
-    leftOnly: function (key, value) {
-      fields[key] = undefined;
-    },
-    rightOnly: function (key, value) {
-      fields[key] = value;
-    },
-    both: function (key, leftValue, rightValue) {
-      if (!EJSON.equals(leftValue, rightValue))
-        fields[key] = rightValue;
-    }
-  });
-  return fields;
-};
-
-// Is this selector just shorthand for lookup by _id?
-LocalCollection._selectorIsId = function (selector) {
-  return (typeof selector === "string") ||
-    (typeof selector === "number") ||
-    selector instanceof LocalCollection._ObjectID;
-};
+  var Package = {minimongo: {LocalCollection: LocalCollection}, "diff-sequence" : {DiffSequence: DiffSequence}};
 
 // ordered: bool.
 // old_results and new_results: collections of documents.
@@ -13147,10 +23999,11 @@ seqChangedToCursor = function (lastSeqArray, cursor, callbacks) {
 
   return [seqArray, observeHandle];
 };
+  Meteor.LocalCollection = LocalCollection;
   Meteor.ObserveSequence = ObserveSequence;
 };
 
-},{}],29:[function(require,module,exports){
+},{}],43:[function(require,module,exports){
 module.exports = function(Meteor) {
   var _ = Meteor.underscore;
   var OrderedDict;
@@ -13366,7 +24219,7 @@ OrderedDict.BREAK = {"break": true};
   Meteor.OrderedDict = OrderedDict;
 };
 
-},{}],30:[function(require,module,exports){
+},{}],44:[function(require,module,exports){
 module.exports=function(Meteor) {
   var _ = Meteor.underscore;
   var Random;
@@ -13624,7 +24477,7 @@ if (Meteor.isServer) {
 
 // Create a non-cryptographically secure PRNG with a given seed (using
 // the Alea algorithm)
-Random.createWithSeeds = function (seeds) {
+Random.createWithSeeds = function (...seeds) {
   if (seeds.length === 0) {
     throw new Error("No seeds were provided");
   }
@@ -13634,10 +24487,21 @@ Random.createWithSeeds = function (seeds) {
 // Used like `Random`, but much faster and not cryptographically
 // secure
 Random.insecure = createAleaGeneratorWithGeneratedSeed();
+  // Create a non-cryptographically secure PRNG with a given seed (using
+  // the Alea algorithm)
+  Random.createWithSeeds = function () {
+    var seeds = [];
+    for (var i=0;i<arguments.length;++i) seeds.push(arguments[i]);
+    if (seeds.length === 0) {
+      throw new Error("No seeds were provided");
+    }
+    return new RandomGenerator(RandomGenerator.Type.ALEA, { seeds: seeds });
+  };
+
   Meteor.Random = Random;
 };
 
-},{}],31:[function(require,module,exports){
+},{}],45:[function(require,module,exports){
 module.exports = function(Meteor) {
 var Tracker = Meteor.Tracker;
 var ReactiveVar;
@@ -13740,7 +24604,7 @@ ReactiveVar.prototype._numListeners = function() {
   Meteor.ReactiveVar = ReactiveVar;
 };
 
-},{}],32:[function(require,module,exports){
+},{}],46:[function(require,module,exports){
 module.exports = function(Meteor) {
   var _ = Meteor.underscore;
   var HTML = Meteor.HTML;
@@ -14954,7 +25818,7 @@ SpacebarsCompiler._beautify = function (code) {
   Meteor.SpacebarsCompiler = SpacebarsCompiler;
 };
 
-},{}],33:[function(require,module,exports){
+},{}],47:[function(require,module,exports){
 module.exports = function(Meteor) {
 var HTML = Meteor.HTML;
 var Tracker = Meteor.Tracker;
@@ -15264,7 +26128,7 @@ Spacebars.TemplateWith = Blaze._TemplateWith;
   Meteor.Spacebars = Spacebars;
 };
 
-},{}],34:[function(require,module,exports){
+},{}],48:[function(require,module,exports){
 module.exports = function(Meteor) {
   var _ = Meteor.underscore;
   var Blaze = Meteor.Blaze;
@@ -15351,7 +26215,7 @@ Template.__body__.__instantiate = Template.body.renderToDocument;
   Meteor.Template = Template;
 };
 
-},{}],35:[function(require,module,exports){
+},{}],49:[function(require,module,exports){
 (function (process){
 module.exports=function(Meteor) {
   var _ = Meteor.underscore;
@@ -16031,7 +26895,7 @@ Tinytest._TestRun = TestRun;
 };
 
 }).call(this,require('_process'))
-},{"_process":1}],36:[function(require,module,exports){
+},{"_process":1}],50:[function(require,module,exports){
 module.exports = function(Meteor) {
   var Tracker;
 /////////////////////////////////////////////////////
@@ -16656,7 +27520,7 @@ Tracker.afterFlush = function (f) {
   Meteor.Tracker = Tracker;
 };
 
-},{}],37:[function(require,module,exports){
+},{}],51:[function(require,module,exports){
 /*!
  * jQuery JavaScript Library v2.2.1
  * http://jquery.com/
@@ -26489,7 +37353,7 @@ if ( !noGlobal ) {
 return jQuery;
 }));
 
-},{}],38:[function(require,module,exports){
+},{}],52:[function(require,module,exports){
 (function (global){
 /**
  * @license
@@ -38844,32 +49708,49 @@ return jQuery;
 }.call(this));
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],39:[function(require,module,exports){
+},{}],53:[function(require,module,exports){
 (function (global){
-global.__meteor_runtime_config__ = {};
-
 require("./index.js");
-
 //Export all Meteor objects to global
 for (var k in Meteor)
-	global[k] = Meteor[k];
+	//Do not override
+	if (!global[k])
+		global[k] = Meteor[k];
 
+require("./meteor/packages/test-helpers/async_multi.js");
 require("./meteor/packages/test-helpers/canonicalize_html.js");
-
+require("./meteor/packages/meteor/client_environment_test.js");
+require("./meteor/packages/meteor/helpers_test.js");
+require("./meteor/packages/meteor/timers_tests.js");
 require("./meteor/packages/base64/base64_test.js");
 require("./meteor/packages/ejson/custom_models_for_tests.js");
 require("./meteor/packages/ejson/ejson_test.js");
-require("./meteor/packages/meteor/client_environment_test.js");
 require("./meteor/packages/random/random_tests.js");
+require("./meteor/packages/diff-sequence/tests.js");
+
+//Imports required by observe sequence tests
+Package = {};
+require("./meteor/packages/check/match.js");
+require("./meteor/packages/allow-deny/allow-deny.js");
+require("./meteor/packages/mongo/collection.js");
+require("./meteor/packages/mongo/local_collection_driver.js");
+require("./meteor/packages/observe-sequence/observe_sequence_tests.js");
+
+GeoJSON = require("./meteor/packages/geojson-utils/geojson-utils.js");
+require("./meteor/packages/minimongo/minimongo_tests.js");
+require("./meteor/packages/minimongo/wrap_transform_tests.js");
+
+require("./meteor/packages/htmljs/htmljs_test.js");
 require("./meteor/packages/html-tools/parse_tests.js");
 require("./meteor/packages/html-tools/tokenize_tests.js");
 require("./meteor/packages/html-tools/charref_tests.js");
+require("./meteor/packages/tracker/tracker_tests.js");
 require("./meteor/packages/blaze/render_tests.js");
 require("./meteor/packages/blaze/view_tests.js");
 require("./meteor/packages/blaze-tools/token_tests.js");
 require("./meteor/packages/htmljs/htmljs_test.js");
-require("./meteor/packages/spacebars-compiler/compile_tests.js");
 require("./meteor/packages/spacebars-compiler/spacebars_tests.js");
+
 
 var ok = 0;
 var error = 0;
@@ -38892,6 +49773,10 @@ Tinytest._runTests(
 				console.error("[ERROR ] " + results.test,event.details);
 				error++;
 				num++;
+			} else if (event.type==="fail") {
+				console.error("[FAIL  ] " + results.test,event.details);
+				error++;
+				num++;
 			} else {
 				console.error("[UNK   ] " + results.test + " :" + JSON.stringify(event));
 			}
@@ -38905,4 +49790,4 @@ Tinytest._runTests(
 );
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./index.js":3,"./meteor/packages/base64/base64_test.js":4,"./meteor/packages/blaze-tools/token_tests.js":5,"./meteor/packages/blaze/render_tests.js":6,"./meteor/packages/blaze/view_tests.js":7,"./meteor/packages/ejson/custom_models_for_tests.js":8,"./meteor/packages/ejson/ejson_test.js":9,"./meteor/packages/html-tools/charref_tests.js":10,"./meteor/packages/html-tools/parse_tests.js":11,"./meteor/packages/html-tools/tokenize_tests.js":12,"./meteor/packages/htmljs/htmljs_test.js":13,"./meteor/packages/meteor/client_environment_test.js":14,"./meteor/packages/random/random_tests.js":15,"./meteor/packages/spacebars-compiler/compile_tests.js":16,"./meteor/packages/spacebars-compiler/spacebars_tests.js":17,"./meteor/packages/test-helpers/canonicalize_html.js":18}]},{},[39]);
+},{"./index.js":3,"./meteor/packages/allow-deny/allow-deny.js":4,"./meteor/packages/base64/base64_test.js":5,"./meteor/packages/blaze-tools/token_tests.js":6,"./meteor/packages/blaze/render_tests.js":7,"./meteor/packages/blaze/view_tests.js":8,"./meteor/packages/check/match.js":9,"./meteor/packages/diff-sequence/tests.js":10,"./meteor/packages/ejson/custom_models_for_tests.js":11,"./meteor/packages/ejson/ejson_test.js":12,"./meteor/packages/geojson-utils/geojson-utils.js":13,"./meteor/packages/html-tools/charref_tests.js":14,"./meteor/packages/html-tools/parse_tests.js":15,"./meteor/packages/html-tools/tokenize_tests.js":16,"./meteor/packages/htmljs/htmljs_test.js":17,"./meteor/packages/meteor/client_environment_test.js":18,"./meteor/packages/meteor/helpers_test.js":19,"./meteor/packages/meteor/timers_tests.js":20,"./meteor/packages/minimongo/minimongo_tests.js":21,"./meteor/packages/minimongo/wrap_transform_tests.js":22,"./meteor/packages/mongo/collection.js":23,"./meteor/packages/mongo/local_collection_driver.js":24,"./meteor/packages/observe-sequence/observe_sequence_tests.js":25,"./meteor/packages/random/random_tests.js":26,"./meteor/packages/spacebars-compiler/spacebars_tests.js":27,"./meteor/packages/test-helpers/async_multi.js":28,"./meteor/packages/test-helpers/canonicalize_html.js":29,"./meteor/packages/tracker/tracker_tests.js":30}]},{},[53]);

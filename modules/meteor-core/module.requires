@@ -1,5 +1,12 @@
 module.exports = function(underscore) {
   var Meteor;
+  var meteorEnv;
   var _ = underscore; 
   var Package = {};
+
+  var __meteor_runtime_config__ = {
+	meteorEnv : {
+			NODE_ENV : process.env.NODE_ENV || 'production'
+		}
+  };
 

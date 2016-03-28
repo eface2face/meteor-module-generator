@@ -1,2 +1,3 @@
+  Meteor.LocalCollection = LocalCollection;
   Meteor.ObserveSequence = ObserveSequence;
 };
