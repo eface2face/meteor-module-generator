@@ -10,3 +10,6 @@ module.exports = function(Meteor) {
   var MinimongoError;
  
   var Package = {};
+
+  //Don't sport to global
+  var LocalCollection,isArray,isPlainObject,isIndexable,isOperatorObject,isNumericKey,regexpElementMatcher,equalityElementMatcher,ELEMENT_OPERATORS,makeLookupFunction,expandArraysInBranches,projectionDetails,pathsToTree;

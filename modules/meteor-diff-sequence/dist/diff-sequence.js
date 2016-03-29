@@ -1,5 +1,6 @@
 module.exports=function(Meteor) {
   var _ = Meteor.underscore;
+  var EJSON = Meteor.EJSON;
   var DiffSequence;
 DiffSequence = {};
 
