@@ -7,4 +7,4 @@ module.exports = function(Meteor) {
   var Package = {};
   var SpacebarsCompiler;
   var TemplateTag;
-
+  var ReactComponentSiblingForbidder;
